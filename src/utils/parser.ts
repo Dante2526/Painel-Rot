@@ -44,14 +44,21 @@ export const parseWabtecBinary = (buffer: ArrayBuffer): TelemetryData => {
   };
 
   for (let i = 0; i < data.length; i++) {
-    // Sincronia de Tempo (0xEB)
-    if (data[i] === TAGS.TIME_SYNC) {
-      fillSecond();
-      currentSecond++;
-      // Reset de flags momentâneas (buzina/sino)
-      lastValues.buzina = 0;
-      lastValues.sino = 0;
-      continue;
+    // Sincronia de Tempo (0xEB ou Início de Tag EG)
+    const isEG = data[i] === TAGS.EG[0] && data[i+1] === TAGS.EG[1] && data[i+2] === TAGS.EG[2];
+    
+    if (data[i] === TAGS.TIME_SYNC || isEG) {
+      // Evita duplicar o primeiro segundo se começar com EG
+      if (i > 0 || data[i] === TAGS.TIME_SYNC) {
+        fillSecond();
+        currentSecond++;
+        // Reset de flags momentâneas
+        lastValues.buzina = 0;
+        lastValues.sino = 0;
+      }
+      
+      if (data[i] === TAGS.TIME_SYNC) continue;
+      // Se for EG, continua o processamento abaixo para ler o valor
     }
 
     // Busca por Tags

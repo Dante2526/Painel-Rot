@@ -278,7 +278,7 @@ const App = () => {
             <h1 className="text-4xl font-black tracking-tight text-white uppercase italic">Painel-Rot</h1>
             {fileData && (
               <p className="text-[10px] text-emerald-400 font-mono mt-1">
-                MODO EVO: {Object.values(fileData)[0]?.length || 0} AMOSTRAS DETECTADAS
+                MODO DAS III: {Object.values(fileData)[0]?.length || 0} AMOSTRAS DETECTADAS
               </p>
             )}
           </div>
