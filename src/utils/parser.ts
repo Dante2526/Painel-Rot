@@ -10,6 +10,13 @@ export interface TelemetryData {
 
 export const parseWabtecBinary = (buffer: ArrayBuffer): TelemetryData => {
   const data = new Uint8Array(buffer);
+  
+  // Detecção de Arquivo Misto (ASCII/IFCDATA)
+  const header = new TextDecoder().decode(data.slice(0, 7));
+  if (header === 'IFCDATA') {
+    return parseIFCDATAText(new TextDecoder().decode(data));
+  }
+
   const channels: TelemetryData = {};
   
   // Inicialização de canais conforme especificação DAS III
@@ -18,7 +25,7 @@ export const parseWabtecBinary = (buffer: ArrayBuffer): TelemetryData => {
 
   const TAGS = {
     EG: [0x26, 0x82, 0x80],
-    BC: [0x84, 0xE8, 0x8A],
+    BC: [0x84, 0xA8, 0x8A], // Corrigido de E8 para A8 conforme feedback
     NOTCH: [0xC2],
     HORN: [0xC1, 0xC2],
     BELL: [0xC1, 0xC4],
@@ -111,5 +118,36 @@ export const parseWabtecBinary = (buffer: ArrayBuffer): TelemetryData => {
   }
 
   console.log(`[Parser DAS III] Scan Finalizado: ${channels['eg'].length} segundos processados.`);
+  return channels;
+};
+
+/**
+ * Parser para logs DAS III em formato texto (ASCII/IFCDATA)
+ */
+const parseIFCDATAText = (text: string): TelemetryData => {
+  const channels: TelemetryData = {
+    eg: [], bc: [], notch: [], buzina: [], sino: [], direcao: [], velocidade: []
+  };
+
+  const lines = text.split('\n');
+  lines.forEach(line => {
+    if (line.includes('BP:') || line.includes('BC:')) {
+      // Exemplo de linha: BP: 90 BC: 0 V: 0 N: 0
+      const bpMatch = line.match(/BP:\s*(\d+)/);
+      const bcMatch = line.match(/BC:\s*(\d+)/);
+      const vMatch = line.match(/V:\s*(\d+)/);
+      const nMatch = line.match(/N:\s*(\d+)/);
+
+      channels.eg.push(bpMatch ? parseInt(bpMatch[1]) : 90);
+      channels.bc.push(bcMatch ? parseInt(bcMatch[1]) : 0);
+      channels.velocidade.push(vMatch ? parseInt(vMatch[1]) : 0);
+      channels.notch.push(nMatch ? parseInt(nMatch[1]) : 0);
+      channels.buzina.push(0);
+      channels.sino.push(0);
+      channels.direcao.push(1);
+    }
+  });
+
+  console.log(`[Parser IFCDATA] Texto processado: ${channels.eg.length} amostras.`);
   return channels;
 };
