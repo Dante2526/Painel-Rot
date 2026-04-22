@@ -16,130 +16,139 @@ import rulesData from './rules.json';
 const BIAS = 54;
 
 const CHANNEL_NAMES: Record<string, string> = {
-  offset_11: "Encanamento Geral (EG)",
-  offset_3: "Reservatório Equilibrante (ER)",
-  offset_4: "Velocidade (km/h)",
-  offset_7: "Cilindro de Freio (BC)",
-  offset_14: "Freio Independente",
-  offset_15: "Amperagem (Amp)",
-  offset_21: "Sentido (Reversora)",
-  offset_0: "Acelerador (Notch)",
-  offset_9: "Buzina (Horn)",
-  sino: "Sino (Bell)"
+  eg: "Encanamento Geral (EG)",
+  bc: "Cilindro de Freio (BC)",
+  velocidade: "Velocidade (km/h)",
+  notch: "Acelerador (Notch)",
+  buzina: "Buzina (Horn)",
+  sino: "Sino (Bell)",
+  direcao: "Sentido (Reversora)"
 };
 
 
 const App = () => {
-  const [fileData, setFileData] = useState<any>(null);
+  const [fileData, setFileData] = useState<TelemetryData | null>(null);
   const [fileName, setFileName] = useState<string>("");
   const [selectedOffset, setSelectedOffset] = useState('offset_1');
   const [viewMode, setViewMode] = useState<'single' | 'multi'>('multi');
   const [activeTab, setActiveTab] = useState<'telemetry' | 'compliance'>('telemetry');
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [auditResults, setAuditResults] = useState<AuditResult | null>(null);
-  const [showDebug, setShowDebug] = useState(false);
-  const [hoverIndex, setHoverIndex] = useState<number | null>(null);
-
-  // Estados para Controle de Tempo
-  const [fileStartTime, setFileStartTime] = useState<string>("08:00:00");
-  const [auditWindow, setAuditWindow] = useState({ start: "00:00:00", end: "23:59:59" });
-
-  const timeToSeconds = (timeStr: string) => {
-    const [h, m, s] = timeStr.split(':').map(Number);
-    return (h * 3600) + (m * 60) + (s || 0);
-  };
-
-  const secondsToTime = (totalSecs: number) => {
-    const h = Math.floor(totalSecs / 3600) % 24;
-    const m = Math.floor((totalSecs % 3600) / 60);
-    const s = totalSecs % 60;
-    return `${h.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
-  };
+  
+  // Novos estados para controle de tempo e auditoria
+  const [fileStartTime, setFileStartTime] = useState("00:00:00");
+  const [auditWindow, setAuditWindow] = useState({ start: "06:57:00", end: "09:11:00" });
 
   const CHANNEL_CONFIG: Record<string, { bias: number, mult: number }> = {
-    offset_11: { bias: 0, mult: 0.5 },    // Calibrado: 178 -> 89 PSI (EG)
-    offset_3: { bias: 0, mult: 0.5 },     // Reservatório Equilibrante
-    offset_4: { bias: 0, mult: 0.25 },    // Velocidade
-    offset_7: { bias: 0, mult: 0.5 },     // Cilindro de Freio
-    offset_14: { bias: 0, mult: 0.5 },    // Freio Indep
-    offset_15: { bias: 128, mult: 11 },    // Amperagem Evo
-    offset_21: { bias: 0, mult: 1 },      // Reversora
-    offset_0: { bias: 0, mult: 1 },       // Acelerador Evo (OFF_0)
-    offset_9: { bias: 0, mult: 1 }        // Buzina Evo (OFF_9)
+    eg: { bias: 0, mult: 1 },         // Já corrigido no parser (-64)
+    bc: { bias: 0, mult: 0.3 },      // 240 -> 72 PSI (BC)
+    velocidade: { bias: 0, mult: 1 }, 
+    notch: { bias: 0, mult: 1 },      
+    direcao: { bias: 0, mult: 1 }     
   };
 
 
   const handleFileLoaded = (buffer: ArrayBuffer, name: string) => {
     const telemetry = parseWabtecBinary(buffer);
-    const results = auditConduction(telemetry);
-    
     setFileData(telemetry);
     setFileName(name);
+    
+    // Executa auditoria inicial
+    const results = auditConduction(telemetry);
     setAuditResults(results);
+    
     setIsModalOpen(true);
-    setSelectedOffset('offset_11');
+    setSelectedOffset('eg');
   };
 
-  // Prepara dados formatados para múltiplos canais
+  // Função para converter segundos em HH:mm:ss baseado no horário de início
+  const formatTime = (seconds: number, startStr: string) => {
+    const [h, m, s] = startStr.split(':').map(Number);
+    const totalSeconds = (h * 3600 + m * 60 + s + seconds) % 86400;
+    const hh = Math.floor(totalSeconds / 3600).toString().padStart(2, '0');
+    const mm = Math.floor((totalSeconds % 3600) / 60).toString().padStart(2, '0');
+    const ss = (totalSeconds % 60).toString().padStart(2, '0');
+    return `${hh}:${mm}:${ss}`;
+  };
+
+  // Helper para converter HH:mm:ss em segundos desde meia-noite
+  const timeToSeconds = (timeStr: string) => {
+    const [h, m, s] = timeStr.split(':').map(Number);
+    return (h * 3600 + m * 60 + (s || 0));
+  };
+
+  // Prepara dados formatados para múltiplos canais, filtrados pela janela de auditoria
   const syncedData = useMemo(() => {
     if (!fileData) return [];
     
-    const refChannel = fileData['offset_11'] ? 'offset_11' : Object.keys(fileData)[0];
-    const fullLength = fileData[refChannel]?.length || 0;
+    // Tenta usar a maior contagem de amostras disponível entre os canais
+    const totalSamples = Math.max(...Object.values(fileData).map(arr => arr.length));
+    if (totalSamples === 0) return [];
+
+    const logStart = timeToSeconds(fileStartTime);
+    const winStart = timeToSeconds(auditWindow.start);
+    const winEnd = timeToSeconds(auditWindow.end);
     
-    const windowStartAbs = timeToSeconds(auditWindow.start);
-    const windowEndAbs = timeToSeconds(auditWindow.end);
-    const logStartBase = timeToSeconds(fileStartTime);
+    // Calcula índices relativos ao início do log
+    let startIndex = winStart - logStart;
+    let endIndex = winEnd - logStart;
+    
+    // LÓGICA DE SEGURANÇA: Se a janela estiver fora do arquivo, mostra tudo por padrão
+    if (startIndex < 0 || startIndex >= totalSamples || endIndex <= startIndex) {
+      startIndex = 0;
+      endIndex = totalSamples;
+      finalEnd = totalSamples;
+    } else {
+      // Garante que o finalEnd não estoure o arquivo
+      finalEnd = Math.min(totalSamples, finalEnd);
+    }
 
-    const dataPoints = [];
-    for (let i = 0; i < fullLength; i++) {
-      const currentAbsoluteSecs = logStartBase + i; 
+    const result = [];
+    for (let i = startIndex; i < endIndex; i++) {
+      const entry: any = { 
+        index: i,
+        timestamp: formatTime(i, fileStartTime)
+      };
       
-      if (currentAbsoluteSecs >= windowStartAbs && currentAbsoluteSecs <= windowEndAbs) {
-        const entry: any = { 
-          index: i,
-          timestamp: secondsToTime(currentAbsoluteSecs)
-        };
+      Object.keys(fileData).forEach(offset => {
+        const channelData = fileData[offset];
+        const raw = channelData[i] ?? 0;
+        const config = CHANNEL_CONFIG[offset] || { bias: 0, mult: 1 };
+        let converted = (raw - (config.bias || 0)) * (config.mult || 1);
         
-        Object.keys(fileData).forEach(offset => {
-          const raw = fileData[offset][i];
-          const config = CHANNEL_CONFIG[offset] || { bias: 0, mult: 1 };
-          let converted = (raw - config.bias) * config.mult;
-          
-          if (offset === 'offset_7' || offset === 'offset_14') converted = Math.max(0, converted);
-          if (offset === 'offset_11' || offset === 'offset_3') converted = Math.min(110, Math.max(0, converted));
-          
-          entry[offset] = Math.round(converted);
-        });
-        dataPoints.push(entry);
-      }
+        if (offset === 'eg') converted = Math.min(100, Math.max(0, converted));
+        entry[offset] = Math.round(converted);
+      });
+      
+      result.push(entry);
     }
+    return result;
+  }, [fileData, fileStartTime, auditWindow]);
 
-    // Se o filtro for muito restrito, mostra tudo para evitar tela vazia
-    if (dataPoints.length === 0) return [{ timestamp: 'Sem Dados', index: 0 }];
+  // Auditoria filtrada por janela
+  useEffect(() => {
+    if (!fileData) return;
+    
+    // Converte auditWindow para índices
+    const [hS, mS, sS] = auditWindow.start.split(':').map(Number);
+    const [hF, mF, sF] = fileStartTime.split(':').map(Number);
+    const startSecs = (hS * 3600 + mS * 60 + sS) - (hF * 3600 + mF * 60 + sF);
+    
+    const [hE, mE, sE] = auditWindow.end.split(':').map(Number);
+    const endSecs = (hE * 3600 + mE * 60 + sE) - (hF * 3600 + mF * 60 + sF);
 
-    // Downsampling para performance (max 2000 pontos no gráfico)
-    const MAX_POINTS = 2000;
-    if (dataPoints.length > MAX_POINTS) {
-      const step = Math.ceil(dataPoints.length / MAX_POINTS);
-      return dataPoints.filter((_, idx) => idx % step === 0);
-    }
+    // Ajusta para ciclos de 24h se necessário
+    const startIndex = Math.max(0, startSecs);
+    const endIndex = Math.min(fileData['offset_11']?.length || 0, endSecs);
 
-    return dataPoints;
-  }, [fileData, auditWindow, fileStartTime]);
-
-  // Filtra eventos da auditoria com base na janela selecionada (Tempo Absoluto)
-  const filteredEvents = useMemo(() => {
-    if (!auditResults) return [];
-    const windowStartAbs = timeToSeconds(auditWindow.start);
-    const windowEndAbs = timeToSeconds(auditWindow.end);
-    const logStartBase = timeToSeconds(fileStartTime);
-
-    return auditResults.events.filter(event => {
-      const eventAbsSecs = logStartBase + event.timestamp;
-      return eventAbsSecs >= windowStartAbs && eventAbsSecs <= windowEndAbs;
+    const filteredTelemetry: TelemetryData = {};
+    Object.keys(fileData).forEach(key => {
+      filteredTelemetry[key] = fileData[key].slice(startIndex, endIndex);
     });
-  }, [auditResults, auditWindow, fileStartTime]);
+
+    const results = auditConduction(filteredTelemetry);
+    setAuditResults(results);
+  }, [fileData, auditWindow, fileStartTime]);
 
 
   if (!fileData) {
@@ -163,26 +172,26 @@ const App = () => {
   }
 
 
-  const ESSENTIAL_CHANNELS = ['offset_11', 'offset_7', 'offset_4', 'offset_15', 'offset_9', 'sino'];
+
+  const ESSENTIAL_CHANNELS = ['eg', 'bc', 'velocidade', 'notch', 'buzina', 'sino'];
   const COLORS: Record<string, string> = {
-    offset_11: "#38bdf8", // Sky Blue (EG)
-    offset_7: "#f87171",  // Red (BC)
-    offset_4: "#fbbf24",  // Amber (Vel)
-    offset_15: "#2dd4bf", // Teal (Amperagem)
-    offset_9: "#818cf8",    // Indigo (Buzina)
+    eg: "#38bdf8", // Sky Blue
+    bc: "#f87171",  // Red
+    velocidade: "#fbbf24",  // Amber
+    notch: "#2dd4bf", // Teal
+    buzina: "#818cf8",    // Indigo
     sino: "#fb923c"       // Orange
   };
 
   const getUnit = (offset: string) => {
-    if (['offset_11', 'offset_3', 'offset_7', 'offset_14'].includes(offset)) return 'PSI';
-    if (offset === 'offset_4') return 'km/h';
-    if (offset === 'offset_15') return 'Amp';
-    if (['offset_9', 'sino'].includes(offset)) return '';
+    if (['eg', 'bc'].includes(offset)) return 'PSI';
+    if (offset === 'velocidade') return 'km/h';
+    if (offset === 'notch') return 'PTA';
     return '';
   };
 
   const SyncedChartRow = ({ offset, height = 220, showX = false }: { offset: string, height?: number, showX?: boolean }) => {
-    const isBinary = ['offset_9', 'sino', 'offset_21'].includes(offset);
+    const isBinary = ['buzina', 'sino', 'offset_21'].includes(offset);
     const currentValue = syncedData[syncedData.length - 1]?.[offset] || 0;
     
     // Escalas fixas para pressões
@@ -210,7 +219,7 @@ const App = () => {
         </div>
         <div className="flex-1 bg-slate-900/40 rounded-[1.5rem] p-4 relative overflow-hidden">
           <ResponsiveContainer width="100%" height="100%">
-            <LineChart data={syncedData} syncId="wabtec" onMouseMove={(e) => e.activePayload && setHoverIndex(e.activePayload[0].payload.index)}>
+            <LineChart data={syncedData} syncId="wabtec">
               <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.02)" vertical={false} />
               <XAxis 
                 dataKey="timestamp" 
@@ -262,28 +271,17 @@ const App = () => {
             <Train size={36} className="text-white" />
           </div>
           <div>
-            <div className="flex items-center gap-2 mb-3">
+            <div className="flex items-center gap-2 mb-1">
               <span className="px-2 py-0.5 bg-blue-500/10 text-blue-400 text-[10px] font-bold uppercase tracking-widest rounded-full border border-blue-500/20">
                 Monitoramento em Tempo Real
               </span>
             </div>
-            <div className="flex items-center gap-6">
-              <h1 className="text-4xl font-black tracking-tight text-white uppercase italic">Painel-Rot</h1>
-              
-              <div className="flex items-center gap-3">
-                <button 
-                  onClick={() => setShowDebug(!showDebug)}
-                  className={`px-4 py-2 rounded-full text-[10px] font-black transition-all ${showDebug ? 'bg-orange-500 text-white shadow-[0_0_15px_rgba(249,115,22,0.4)]' : 'bg-white/5 text-slate-400 hover:bg-white/10'}`}
-                >
-                  {showDebug ? 'MODO ENGENHARIA ATIVO' : 'CALIBRAR OFFSETS'}
-                </button>
-                <div className="px-6 py-2 bg-blue-600/20 border border-blue-500/30 rounded-full">
-                  <span className="text-blue-400 text-[10px] font-black tracking-widest animate-pulse uppercase">
-                    MODO EVO ATIVO: {Object.values(fileData)[0]?.length || 0} AMOSTRAS
-                  </span>
-                </div>
-              </div>
-            </div>
+            <h1 className="text-4xl font-black tracking-tight text-white uppercase italic">Painel-Rot</h1>
+            {fileData && (
+              <p className="text-[10px] text-emerald-400 font-mono mt-1">
+                MODO EVO: {Object.values(fileData)[0]?.length || 0} AMOSTRAS DETECTADAS
+              </p>
+            )}
           </div>
         </div>
         
@@ -308,12 +306,12 @@ const App = () => {
            <div className="flex bg-white/5 p-1 rounded-xl border border-white/5 items-center px-3 gap-4">
              <div className="flex items-center gap-2">
                <Clock size={14} className="text-blue-400" />
-               <span className="text-[10px] font-bold text-slate-500 uppercase">Início Log:</span>
+               <span className="text-[10px] font-bold text-slate-500 uppercase">Início do Log:</span>
                <input 
                  type="text" 
                  value={fileStartTime} 
                  onChange={(e) => setFileStartTime(e.target.value)}
-                 className="bg-transparent border-b border-blue-500/30 text-xs font-mono w-20 focus:outline-none focus:border-blue-500 text-center"
+                 className="bg-transparent border-b border-blue-500/30 text-xs font-mono w-20 focus:outline-none focus:border-blue-500"
                />
              </div>
              <div className="w-px h-4 bg-white/10" />
@@ -324,14 +322,14 @@ const App = () => {
                  type="text" 
                  value={auditWindow.start} 
                  onChange={(e) => setAuditWindow({...auditWindow, start: e.target.value})}
-                 className="bg-transparent border-b border-emerald-500/30 text-xs font-mono w-20 focus:outline-none focus:border-emerald-500 text-center"
+                 className="bg-transparent border-b border-emerald-500/30 text-xs font-mono w-20 focus:outline-none focus:border-emerald-500"
                />
                <span className="text-[10px] text-slate-600">até</span>
                <input 
                  type="text" 
                  value={auditWindow.end} 
                  onChange={(e) => setAuditWindow({...auditWindow, end: e.target.value})}
-                 className="bg-transparent border-b border-emerald-500/30 text-xs font-mono w-20 focus:outline-none focus:border-emerald-500 text-center"
+                 className="bg-transparent border-b border-emerald-500/30 text-xs font-mono w-20 focus:outline-none focus:border-emerald-500"
                />
              </div>
            </div>
@@ -359,36 +357,6 @@ const App = () => {
         </div>
       </header>
 
-      {/* Seção de Calibração (Debug) */}
-      {showDebug && fileData && (
-        <div className="mb-12 p-8 bg-orange-500/5 border border-orange-500/20 rounded-[2.5rem] backdrop-blur-xl">
-           <div className="flex justify-between items-center mb-6">
-              <div>
-                <h3 className="text-orange-500 font-black italic uppercase tracking-tighter text-xl">Painel de Calibração Raw</h3>
-                <p className="text-slate-500 text-xs">Passe o mouse no gráfico para ver os valores brutos de cada offset (0-42)</p>
-              </div>
-              <div className="text-right">
-                <span className="block text-[10px] text-slate-500 uppercase font-bold">Amostra Atual</span>
-                <span className="text-2xl font-mono font-black text-orange-500">#{hoverIndex ?? 0}</span>
-              </div>
-           </div>
-           
-           <div className="grid grid-cols-8 gap-2">
-              {Array.from({ length: 43 }).map((_, i) => {
-                const offset = `offset_${i}`;
-                const val = fileData[offset]?.[hoverIndex ?? 0] ?? 0;
-                const isMapped = !!CHANNEL_CONFIG[offset];
-                return (
-                  <div key={i} className={`p-3 rounded-xl border ${isMapped ? 'bg-blue-500/10 border-blue-500/20' : 'bg-white/5 border-white/5'} flex flex-col items-center justify-center`}>
-                    <span className="text-[9px] text-slate-500 font-bold">OFF_{i}</span>
-                    <span className={`text-lg font-mono font-black ${isMapped ? 'text-blue-400' : 'text-slate-300'}`}>{val}</span>
-                  </div>
-                );
-              })}
-           </div>
-        </div>
-      )}
-
       {activeTab === 'telemetry' ? (
         <div className="animate-in fade-in duration-500">
           {viewMode === 'multi' ? (
@@ -413,15 +381,6 @@ const App = () => {
                       <p className="text-[10px] text-slate-500 uppercase font-black mb-1">Amostras</p>
                       <p className="text-2xl font-black">{syncedData.length}</p>
                     </div>
-                  </div>
-                  
-                  <div className="flex items-center gap-4 mt-6">
-                    <button 
-                      onClick={() => setShowDebug(!showDebug)}
-                      className={`px-4 py-2 rounded-full text-[10px] font-black transition-all ${showDebug ? 'bg-orange-500 text-white shadow-[0_0_15px_rgba(249,115,22,0.4)]' : 'bg-white/5 text-slate-400 hover:bg-white/10'}`}
-                    >
-                      {showDebug ? 'MODO ENGENHARIA ATIVO' : 'CALIBRAR OFFSETS'}
-                    </button>
                   </div>
                 </div>
 
@@ -461,10 +420,9 @@ const App = () => {
                 
                 <div className="space-y-4">
                   {[
-                    { id: 'arrancada', name: 'Arrancada Segura', desc: 'EG 88-90 PSI, Buzina prévia e Sino ligado.', ok: auditResults?.compliance.arrancada_segura },
+                    { id: 'arrancada', name: 'Arrancada Segura', desc: 'Buzina+Sino obrigatórios antes do Ponto 3.', ok: auditResults?.compliance.arrancada_segura },
+                    { id: 'abastecimento', name: 'Abastecimento', desc: 'EG abaixo de 90 PSI por > 60s parado.', ok: auditResults?.compliance.abastecimento_correto },
                     { id: 'reducao_forte', name: 'Redução Strong (<18 PSI)', desc: 'Evita choques bruscos na composição.', ok: auditResults?.compliance.reducao_forte },
-                    { id: 'alivio_rodagem', name: 'Alívio de Rodagem', desc: 'Não aliviar com V < 16 km/h.', ok: auditResults?.compliance.alivio_rodagem },
-                    { id: 'teste_marcha', name: 'Teste de Marcha', desc: 'V < 10 km/h, Notch 1-3, queda 6-8 PSI.', ok: auditResults?.compliance.teste_marcha },
                     { id: 'emergencia', name: 'Procedimento Emergência', desc: 'Siga o protocolo de 6 pontos de segurança.', ok: auditResults?.compliance.emergencia_correta }
                   ].map(item => (
                     <div key={item.id} className={`p-5 rounded-3xl border transition-all ${item.ok ? 'bg-emerald-500/5 border-emerald-500/20' : 'bg-red-500/5 border-red-500/20 shadow-lg shadow-red-500/5'}`}>
@@ -479,24 +437,21 @@ const App = () => {
                       <p className="text-[10px] text-slate-500 font-medium mb-3">{item.desc}</p>
                       
                       {/* Detalhamento do Checklist de Emergência se houver erro */}
-                      {item.id === 'emergencia' && (
+                      {item.id === 'emergencia' && !item.ok && (
                         <div className="grid grid-cols-2 gap-2 mt-2 pt-3 border-t border-red-500/10">
                           {[
-                            { label: 'EG 0 PSI', key: 'eg_zero' },
-                            { label: 'Amp 0', key: 'amp_zero' },
-                            { label: 'Indep. 72', key: 'indep_ok' },
-                            { label: 'Rev. Neutro', key: 'rev_neutro' },
-                            { label: 'Sino Off', key: 'sino_off' },
-                            { label: 'Notch 0', key: 'notch_zero' },
-                          ].map((check, i) => {
-                            const pass = (auditResults as any)?.summaryChecklist?.[check.key] ?? auditResults?.compliance.emergencia_correta;
-                            return (
-                              <div key={i} className="flex items-center gap-1.5">
-                                <div className={`w-1.5 h-1.5 rounded-full ${pass ? 'bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.5)]' : 'bg-red-500'}`} />
-                                <span className={`text-[9px] ${pass ? 'text-emerald-500/70 font-medium' : 'text-red-500 font-black'}`}>{check.label}</span>
-                              </div>
-                            );
-                          })}
+                            { label: 'EG 0 PSI', pass: auditResults?.events.find(e => (e as any).checklist)?.checklist?.eg_zero },
+                            { label: 'Amp 0', pass: auditResults?.events.find(e => (e as any).checklist)?.checklist?.amp_zero },
+                            { label: 'Indep. 72', pass: auditResults?.events.find(e => (e as any).checklist)?.checklist?.indep_ok },
+                            { label: 'Rev. Neutro', pass: auditResults?.events.find(e => (e as any).checklist)?.checklist?.rev_neutro },
+                            { label: 'Sino Off', pass: auditResults?.events.find(e => (e as any).checklist)?.checklist?.sino_off },
+                            { label: 'Notch 0', pass: auditResults?.events.find(e => (e as any).checklist)?.checklist?.notch_zero },
+                          ].map((check, i) => (
+                            <div key={i} className="flex items-center gap-1.5">
+                              <div className={`w-1.5 h-1.5 rounded-full ${check.pass ? 'bg-emerald-500' : 'bg-red-500'}`} />
+                              <span className={`text-[9px] ${check.pass ? 'text-emerald-500/70' : 'text-red-500 font-bold'}`}>{check.label}</span>
+                            </div>
+                          ))}
                         </div>
                       )}
                     </div>
@@ -512,11 +467,11 @@ const App = () => {
                   <History size={26} className="text-blue-500" />
                   Timeline de Eventos Detectados
                 </h2>
-                <span className="text-xs text-slate-500 font-mono">Mostrando: {filteredEvents.length} de {auditResults?.events.length || 0} eventos</span>
+                <span className="text-xs text-slate-500 font-mono">Total: {auditResults?.events.length || 0} eventos encontrados</span>
              </div>
 
              <div className="space-y-4 max-h-[600px] overflow-y-auto px-4 custom-scrollbar">
-                {filteredEvents.length ? filteredEvents.map((event, idx) => (
+                {auditResults?.events.length ? auditResults.events.map((event, idx) => (
                   <div key={idx} className="group relative flex gap-6 p-6 bg-white/5 hover:bg-white/10 border border-white/5 rounded-[1.8rem] transition-all cursor-crosshair">
                      <div className="flex flex-col items-center">
                         <div className={`w-3 h-3 rounded-full mt-2 ${event.severity === 'INFRAÇÃO' ? 'bg-red-500' : 'bg-blue-500'}`} />
@@ -524,9 +479,7 @@ const App = () => {
                      </div>
                      <div className="flex-1">
                         <div className="flex justify-between items-center mb-2">
-                           <span className="text-[10px] font-mono text-slate-500 uppercase tracking-widest">
-                             {secondsToTime(timeToSeconds(fileStartTime) + event.timestamp)}
-                           </span>
+                           <span className="text-[10px] font-mono text-slate-500 uppercase tracking-widest">Amostra {event.timestamp}s</span>
                            <span className={`text-[9px] font-black px-2 py-0.5 rounded shadow-sm ${event.severity === 'INFRAÇÃO' ? 'bg-red-600 text-white' : 'bg-blue-600 text-white'}`}>
                               {event.type.replace('_', ' ')}
                            </span>
@@ -538,7 +491,7 @@ const App = () => {
                 )) : (
                   <div className="flex flex-col items-center justify-center py-20 text-slate-600">
                      <ShieldCheck size={64} className="opacity-10 mb-4" />
-                     <p className="text-lg font-black uppercase tracking-tighter italic">Nenhuma anomalia na janela selecionada</p>
+                     <p className="text-lg font-black uppercase tracking-tighter italic">Nenhuma anomalia crítica na condução</p>
                   </div>
                 )}
              </div>

@@ -1,7 +1,7 @@
 
 /**
- * Parser para os binários proprietários da Wabtec (.dat)
- * Suporta formatos legados (IFCD) e o novo formato LDP identificado.
+ * Parser para os binários proprietários da Wabtec (DAS III / Evolution)
+ * Baseado em busca de tags e frames por segundo (0xEB).
  */
 
 export interface TelemetryData {
@@ -12,118 +12,97 @@ export const parseWabtecBinary = (buffer: ArrayBuffer): TelemetryData => {
   const data = new Uint8Array(buffer);
   const channels: TelemetryData = {};
   
-  // Inicialização de canais essenciais
-  const essentialKeys = [
-    'offset_1', 'offset_3', 'offset_4', 'offset_7', 'offset_11', 
-    'offset_14', 'offset_15', 'offset_21', 'offset_22', 'buzina', 'sino'
-  ];
-  essentialKeys.forEach(k => channels[k] = []);
+  // Inicialização de canais conforme especificação DAS III
+  const keys = ['eg', 'bc', 'notch', 'buzina', 'sino', 'direcao', 'velocidade', 'reversora'];
+  keys.forEach(k => channels[k] = []);
 
-  // Detector de Formato: LDP ou Legado
-  const isLDP = data[0] === 0x49 && data[1] === 0x46 && data[2] === 0x43; // "IFCD" header of LDP file
-
-  if (isLDP) {
-    console.log("[Parser] Formato LDP Detectado");
-    return parseLDP(data);
-  } else {
-    console.log("[Parser] Formato Legado Detectado");
-    return parseLegacy(data);
-  }
-};
-
-const unescape = (data: Uint8Array) => {
-  const out = [];
-  for (let j = 0; j < data.length; j++) {
-    if (data[j] === 0x10 && j + 1 < data.length) {
-      out.push(data[j+1]);
-      j++;
-    } else {
-      out.push(data[j]);
-    }
-  }
-  return new Uint8Array(out);
-};
-
-const parseLDP = (data: Uint8Array): TelemetryData => {
-  const channels: TelemetryData = {};
-  const mapping: Record<string, number> = {
-    'offset_4': 0,  // Speed
-    'offset_11': 1, // EG
-    'offset_14': 2, // FI
-    'offset_15': 3, // Current
-    'offset_22': 6, // Throttle
+  const TAGS = {
+    EG: [0x26, 0x82, 0x80],
+    BC: [0x84, 0xE8, 0x8A],
+    NOTCH: [0xC2],
+    HORN: [0xC1, 0xC2],
+    BELL: [0xC1, 0xC4],
+    HORN_BELL: [0xC1, 0xC6],
+    FWD: [0xCC, 0xC4, 0xC0, 0xC0, 0xC0],
+    REV: [0xCC, 0xC4, 0xC0, 0xC0, 0xD0],
+    TIME_SYNC: 0xEB
   };
-  
-  Object.keys(mapping).concat(['buzina', 'sino', 'offset_1', 'offset_3', 'offset_7', 'offset_21']).forEach(k => channels[k] = []);
 
-  let i = 0;
-  while (i < data.length - 1) {
-    if (data[i] === 0x02 && data[i+1] === 0x30) {
-      let start = i + 2;
-      let j = start;
-      let found = false;
-      while (j < data.length) {
-        if (data[j] === 0x10) { j += 2; continue; }
-        if (data[j] === 0x03) {
-          const payload = unescape(data.slice(start, j));
-          if (payload.length === 9) {
-            Object.entries(mapping).forEach(([key, idx]) => {
-              channels[key].push(payload[idx]);
-            });
-            channels['buzina'].push((payload[7] & 0x10) ? 1 : 0);
-            channels['sino'].push((payload[7] & 0x01) ? 1 : 0);
-            // Preenchimento de compatibilidade
-            channels['offset_1'].push(payload[1]);
-            channels['offset_3'].push(payload[1]);
-            channels['offset_7'].push(payload[2]);
-            channels['offset_21'].push(128); // Neutro padrão
-          }
-          i = j + 1;
-          found = true;
-          break;
-        }
-        j++;
+  let currentSecond = 0;
+  let lastValues: { [key: string]: number } = {
+    eg: 90, bc: 0, notch: 0, buzina: 0, sino: 0, direcao: 1, velocidade: 0
+  };
+
+  const fillSecond = () => {
+    channels['eg'].push(lastValues.eg);
+    channels['bc'].push(lastValues.bc);
+    channels['notch'].push(lastValues.notch);
+    channels['buzina'].push(lastValues.buzina);
+    channels['sino'].push(lastValues.sino);
+    channels['direcao'].push(lastValues.direcao);
+    channels['velocidade'].push(lastValues.velocidade);
+  };
+
+  for (let i = 0; i < data.length; i++) {
+    // Sincronia de Tempo (0xEB)
+    if (data[i] === TAGS.TIME_SYNC) {
+      fillSecond();
+      currentSecond++;
+      // Reset de flags momentâneas (buzina/sino)
+      lastValues.buzina = 0;
+      lastValues.sino = 0;
+      continue;
+    }
+
+    // Busca por Tags
+    // EG (&BA)
+    if (data[i] === TAGS.EG[0] && data[i+1] === TAGS.EG[1] && data[i+2] === TAGS.EG[2]) {
+      lastValues.eg = data[i+3] - 64; // Fórmula: Byte - 64
+      i += 3;
+    }
+    // BC (ДиК)
+    else if (data[i] === TAGS.BC[0] && data[i+1] === TAGS.BC[1] && data[i+2] === TAGS.BC[2]) {
+      lastValues.bc = data[i+3]; // Assumindo valor bruto por enquanto
+      i += 3;
+    }
+    // HORN+BELL (БЖ)
+    else if (data[i] === TAGS.HORN_BELL[0] && data[i+1] === TAGS.HORN_BELL[1]) {
+      lastValues.buzina = 1;
+      lastValues.sino = 1;
+      i += 1;
+    }
+    // HORN (БВ)
+    else if (data[i] === TAGS.HORN[0] && data[i+1] === TAGS.HORN[1]) {
+      lastValues.buzina = 1;
+      i += 1;
+    }
+    // BELL (БД)
+    else if (data[i] === TAGS.BELL[0] && data[i+1] === TAGS.BELL[1]) {
+      lastValues.sino = 1;
+      i += 1;
+    }
+    // NOTCH (В)
+    else if (data[i] === TAGS.NOTCH[0]) {
+      const nextByte = data[i+1];
+      // Mapeamento simplificado de Notch (0xB0 = P0, 0xB3 = P3, etc)
+      if (nextByte >= 0xB0 && nextByte <= 0xB8) {
+        lastValues.notch = nextByte - 0xB0;
       }
-      if (!found) break;
-    } else {
-      i++;
+      i += 1;
+    }
+    // SENTIDO (FWD/REV)
+    else if (data[i] === TAGS.FWD[0] && data[i+1] === TAGS.FWD[1] && data[i+2] === TAGS.FWD[2]) {
+      if (data[i+4] === 0xC0) lastValues.direcao = 1; // FWD
+      else if (data[i+4] === 0xD0) lastValues.direcao = -1; // REV
+      i += 4;
     }
   }
-  return channels;
-};
 
-const parseLegacy = (data: Uint8Array): TelemetryData => {
-  const channels: TelemetryData = {};
-  const essentialKeys = [
-    'offset_1', 'offset_3', 'offset_4', 'offset_7', 'offset_11', 
-    'offset_14', 'offset_15', 'offset_21', 'offset_22', 'buzina', 'sino'
-  ];
-  essentialKeys.forEach(k => channels[k] = []);
-
-  const VALID_MARKERS = [0x01, 0x03];
-  let packetsFound = 0;
-
-  for (let i = 0; i < data.length - 43; i++) {
-    const marker = data[i];
-    const magic = data[i + 3];
-
-    if (VALID_MARKERS.includes(marker) && (magic >= 0x80 && magic <= 0x9F)) {
-      packetsFound++;
-      const packet = data.slice(i, i + 43);
-      const b20 = packet[20];
-
-      for (let j = 0; j < 43; j++) {
-        const key = `offset_${j}`;
-        if (!channels[key]) channels[key] = [];
-        channels[key].push(packet[j]);
-      }
-      
-      channels['buzina'].push((b20 & 0x20) ? 1 : 0);
-      channels['sino'].push((b20 & 0x40) ? 1 : 0);
-      i += 25; 
-    }
+  // Se o arquivo não tiver 0xEB, fazemos um fill final para garantir que temos dados
+  if (channels['eg'].length === 0) {
+    fillSecond();
   }
 
-  console.log(`[Parser Evo/Legacy] Scan Finalizado: ${packetsFound} pacotes detectados.`);
+  console.log(`[Parser DAS III] Scan Finalizado: ${channels['eg'].length} segundos processados.`);
   return channels;
 };
