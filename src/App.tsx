@@ -1,558 +1,552 @@
-import React, { useState, useRef, useEffect } from 'react';
-import { Uploader } from './components/Uploader';
-import { analyzeTelemetryLocal } from './lib/localTelemetryAnalyzer';
-import { scanGraphPixels } from './lib/pixelScanner';
-import { ZoomIn, ZoomOut, FileSearch, ShieldCheck, Ruler, ScanLine, BookOpen, Settings } from 'lucide-react';
 
-export default function App() {
-  const [imageFile, setImageFile] = useState<File | null>(null);
-  const [dataFile, setDataFile] = useState<File | null>(null);
-  const [isAnalyzing, setIsAnalyzing] = useState(false);
-  const [result, setResult] = useState<any | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [engineMode, setEngineMode] = useState<'DAT' | 'OPTICAL' | 'RULES'>('DAT');
-  const [isEditMode, setIsEditMode] = useState(false);
-  const [manualPoints, setManualPoints] = useState<any[]>([]);
-  const [pendingPoint, setPendingPoint] = useState<{ x: number, y: number } | null>(null);
-  const [ruleFile, setRuleFile] = useState<File | null>(null);
-  const [referenceFile, setReferenceFile] = useState<File | null>(null);
-  const [extractedRules, setExtractedRules] = useState<any[] | null>(null);
+import React, { useState, useEffect, useMemo } from 'react';
+import { 
+  LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, ReferenceLine 
+} from 'recharts';
+import { 
+  AlertCircle, Train, Settings, FileText, Activity, ShieldCheck, Gauge, Clock, LayoutDashboard, Database, ChevronRight, CheckCircle2, History
+} from 'lucide-react';
 
-  // Zoom and Drag State
-  const [scale, setScale] = useState(1);
-  const containerRef = useRef<HTMLDivElement>(null);
-  const isDragging = useRef(false);
-  const dragStart = useRef({ x: 0, y: 0, scrollLeft: 0, scrollTop: 0 });
-  const [mousePos, setMousePos] = useState({ x: 0, y: 0 });
-  const [showRuler, setShowRuler] = useState(false);
+import { parseWabtecBinary, TelemetryData } from './utils/parser';
+import { auditConduction, AuditResult } from './utils/auditor';
+import FileUploader from './components/FileUploader';
+import InfractionModal from './components/InfractionModal';
+import rulesData from './rules.json';
 
-  const handleZoomIn = () => setScale(s => Math.min(s + 0.5, 4));
-  const handleZoomOut = () => setScale(s => Math.max(s - 0.5, 1));
-  const handleResetZoom = () => setScale(1);
+const BIAS = 54;
 
-  const onMouseDown = (e: React.MouseEvent) => {
-    if (!containerRef.current) return;
-    isDragging.current = true;
-    containerRef.current.classList.add('cursor-grabbing');
-    dragStart.current = {
-      x: e.pageX - containerRef.current.offsetLeft,
-      y: e.pageY - containerRef.current.offsetTop,
-      scrollLeft: containerRef.current.scrollLeft,
-      scrollTop: containerRef.current.scrollTop
-    };
+const CHANNEL_NAMES: Record<string, string> = {
+  offset_11: "Encanamento Geral (EG)",
+  offset_3: "Reservatório Equilibrante (ER)",
+  offset_4: "Velocidade (km/h)",
+  offset_7: "Cilindro de Freio (BC)",
+  offset_14: "Freio Independente",
+  offset_15: "Amperagem (Amp)",
+  offset_21: "Sentido (Reversora)",
+  offset_0: "Acelerador (Notch)",
+  offset_9: "Buzina (Horn)",
+  sino: "Sino (Bell)"
+};
+
+
+const App = () => {
+  const [fileData, setFileData] = useState<any>(null);
+  const [fileName, setFileName] = useState<string>("");
+  const [selectedOffset, setSelectedOffset] = useState('offset_1');
+  const [viewMode, setViewMode] = useState<'single' | 'multi'>('multi');
+  const [activeTab, setActiveTab] = useState<'telemetry' | 'compliance'>('telemetry');
+  const [isModalOpen, setIsModalOpen] = useState(false);
+  const [auditResults, setAuditResults] = useState<AuditResult | null>(null);
+  const [showDebug, setShowDebug] = useState(false);
+  const [hoverIndex, setHoverIndex] = useState<number | null>(null);
+
+  // Estados para Controle de Tempo
+  const [fileStartTime, setFileStartTime] = useState<string>("08:00:00");
+  const [auditWindow, setAuditWindow] = useState({ start: "00:00:00", end: "23:59:59" });
+
+  const timeToSeconds = (timeStr: string) => {
+    const [h, m, s] = timeStr.split(':').map(Number);
+    return (h * 3600) + (m * 60) + (s || 0);
   };
 
-  const onMouseUp = () => {
-    isDragging.current = false;
-    if (containerRef.current) containerRef.current.classList.remove('cursor-grabbing');
+  const secondsToTime = (totalSecs: number) => {
+    const h = Math.floor(totalSecs / 3600) % 24;
+    const m = Math.floor((totalSecs % 3600) / 60);
+    const s = totalSecs % 60;
+    return `${h.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
   };
 
-  const onMouseLeave = () => {
-    isDragging.current = false;
-    if (containerRef.current) containerRef.current.classList.remove('cursor-grabbing');
-    setShowRuler(false);
+  const CHANNEL_CONFIG: Record<string, { bias: number, mult: number }> = {
+    offset_11: { bias: 0, mult: 0.5 },    // Calibrado: 178 -> 89 PSI (EG)
+    offset_3: { bias: 0, mult: 0.5 },     // Reservatório Equilibrante
+    offset_4: { bias: 0, mult: 0.25 },    // Velocidade
+    offset_7: { bias: 0, mult: 0.5 },     // Cilindro de Freio
+    offset_14: { bias: 0, mult: 0.5 },    // Freio Indep
+    offset_15: { bias: 128, mult: 11 },    // Amperagem Evo
+    offset_21: { bias: 0, mult: 1 },      // Reversora
+    offset_0: { bias: 0, mult: 1 },       // Acelerador Evo (OFF_0)
+    offset_9: { bias: 0, mult: 1 }        // Buzina Evo (OFF_9)
   };
 
-  const onMouseMove = (e: React.MouseEvent) => {
-    if (!containerRef.current) return;
-    
-    const rect = containerRef.current.getBoundingClientRect();
-    const x = e.clientX - rect.left + containerRef.current.scrollLeft;
-    const y = e.clientY - rect.top + containerRef.current.scrollTop;
-    setMousePos({ x, y });
 
-    if (!isDragging.current) return;
-    e.preventDefault();
-    const curX = e.pageX - containerRef.current.offsetLeft;
-    const curY = e.pageY - containerRef.current.offsetTop;
-    const walkX = (curX - dragStart.current.x) * 1.5;
-    const walkY = (curY - dragStart.current.y) * 1.5;
-    containerRef.current.scrollLeft = dragStart.current.scrollLeft - walkX;
-    containerRef.current.scrollTop = dragStart.current.scrollTop - walkY;
+  const handleFileLoaded = (buffer: ArrayBuffer, name: string) => {
+    const telemetry = parseWabtecBinary(buffer);
+    const results = auditConduction(telemetry);
+    
+    setFileData(telemetry);
+    setFileName(name);
+    setAuditResults(results);
+    setIsModalOpen(true);
+    setSelectedOffset('offset_11');
   };
 
-  const handleImageClick = (e: React.MouseEvent) => {
-    if (!isEditMode || !containerRef.current) return;
+  // Prepara dados formatados para múltiplos canais
+  const syncedData = useMemo(() => {
+    if (!fileData) return [];
     
-    // Calculate click pos relative to image source
-    const rect = e.currentTarget.getBoundingClientRect();
-    const x = ((e.clientX - rect.left) / rect.width) * 100;
-    const y = ((e.clientY - rect.top) / rect.height) * 100;
+    const refChannel = fileData['offset_11'] ? 'offset_11' : Object.keys(fileData)[0];
+    const fullLength = fileData[refChannel]?.length || 0;
     
-    setPendingPoint({ x, y });
-  };
+    const windowStartAbs = timeToSeconds(auditWindow.start);
+    const windowEndAbs = timeToSeconds(auditWindow.end);
+    const logStartBase = timeToSeconds(fileStartTime);
 
-  const addManualPoint = (type: string, description: string, severity: string) => {
-    if (!pendingPoint) return;
-    
-    const newPoint = {
-      timestampOrSection: "MARCAÇÃO MANUAL",
-      channel: type,
-      description,
-      severity,
-      visualX: pendingPoint.x,
-      visualY: pendingPoint.y,
-      isManual: true
-    };
-    
-    setManualPoints(prev => [...prev, newPoint]);
-    setPendingPoint(null);
-  };
-
-  const handleRunAnalysis = async () => {
-    if (engineMode === 'OPTICAL' && !imageFile) {
-      setError("O Scanner Óptico exige a Fita Gráfica (Imagem).");
-      return;
-    }
-
-    if (engineMode === 'DAT' && !dataFile) {
-      setError("O modo Binário exige o arquivo .DAT da telemetria.");
-      return;
-    }
-    
-    setIsAnalyzing(true);
-    setError(null);
-    setResult(null);
-
-    try {
-      let res;
-      if (engineMode === 'OPTICAL' && imageFile) {
-         res = await scanGraphPixels(imageFile, referenceFile || undefined);
-      } else {
-         res = await analyzeTelemetryLocal(dataFile || null);
+    const dataPoints = [];
+    for (let i = 0; i < fullLength; i++) {
+      const currentAbsoluteSecs = logStartBase + i; 
+      
+      if (currentAbsoluteSecs >= windowStartAbs && currentAbsoluteSecs <= windowEndAbs) {
+        const entry: any = { 
+          index: i,
+          timestamp: secondsToTime(currentAbsoluteSecs)
+        };
+        
+        Object.keys(fileData).forEach(offset => {
+          const raw = fileData[offset][i];
+          const config = CHANNEL_CONFIG[offset] || { bias: 0, mult: 1 };
+          let converted = (raw - config.bias) * config.mult;
+          
+          if (offset === 'offset_7' || offset === 'offset_14') converted = Math.max(0, converted);
+          if (offset === 'offset_11' || offset === 'offset_3') converted = Math.min(110, Math.max(0, converted));
+          
+          entry[offset] = Math.round(converted);
+        });
+        dataPoints.push(entry);
       }
-      setResult(res);
-    } catch (err: any) {
-      console.error(err);
-      setError(err.message || "Ocorreu um erro durante a análise.");
-    } finally {
-      setIsAnalyzing(false);
     }
+
+    // Se o filtro for muito restrito, mostra tudo para evitar tela vazia
+    if (dataPoints.length === 0) return [{ timestamp: 'Sem Dados', index: 0 }];
+
+    // Downsampling para performance (max 2000 pontos no gráfico)
+    const MAX_POINTS = 2000;
+    if (dataPoints.length > MAX_POINTS) {
+      const step = Math.ceil(dataPoints.length / MAX_POINTS);
+      return dataPoints.filter((_, idx) => idx % step === 0);
+    }
+
+    return dataPoints;
+  }, [fileData, auditWindow, fileStartTime]);
+
+  // Filtra eventos da auditoria com base na janela selecionada (Tempo Absoluto)
+  const filteredEvents = useMemo(() => {
+    if (!auditResults) return [];
+    const windowStartAbs = timeToSeconds(auditWindow.start);
+    const windowEndAbs = timeToSeconds(auditWindow.end);
+    const logStartBase = timeToSeconds(fileStartTime);
+
+    return auditResults.events.filter(event => {
+      const eventAbsSecs = logStartBase + event.timestamp;
+      return eventAbsSecs >= windowStartAbs && eventAbsSecs <= windowEndAbs;
+    });
+  }, [auditResults, auditWindow, fileStartTime]);
+
+
+  if (!fileData) {
+    return (
+      <div className="min-h-screen bg-[#020617] text-slate-100 flex items-center justify-center p-8 font-sans overflow-hidden">
+        <div className="max-w-xl w-full text-center">
+          <div className="w-20 h-20 bg-blue-600 rounded-3xl flex items-center justify-center shadow-2xl mx-auto mb-8 shadow-blue-600/30">
+            <Train size={44} className="text-white" />
+          </div>
+          <h1 className="text-5xl font-black mb-4 tracking-tighter italic text-transparent bg-clip-text bg-gradient-to-r from-white to-blue-400">PAINEL-ROT</h1>
+          <p className="text-slate-400 mb-12 text-lg font-medium leading-relaxed">
+            Auditoria avançada de telemetria Wabtec. <br/>
+            Carregue os dados da locomotiva para iniciar.
+          </p>
+          <div className="h-[300px]">
+            <FileUploader onFileLoaded={handleFileLoaded} />
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+
+  const ESSENTIAL_CHANNELS = ['offset_11', 'offset_7', 'offset_4', 'offset_15', 'offset_9', 'sino'];
+  const COLORS: Record<string, string> = {
+    offset_11: "#38bdf8", // Sky Blue (EG)
+    offset_7: "#f87171",  // Red (BC)
+    offset_4: "#fbbf24",  // Amber (Vel)
+    offset_15: "#2dd4bf", // Teal (Amperagem)
+    offset_9: "#818cf8",    // Indigo (Buzina)
+    sino: "#fb923c"       // Orange
   };
 
-  const isButtonDisabled = isAnalyzing || 
-    (engineMode === 'OPTICAL' && !imageFile) || 
-    (engineMode === 'DAT' && !dataFile);
+  const getUnit = (offset: string) => {
+    if (['offset_11', 'offset_3', 'offset_7', 'offset_14'].includes(offset)) return 'PSI';
+    if (offset === 'offset_4') return 'km/h';
+    if (offset === 'offset_15') return 'Amp';
+    if (['offset_9', 'sino'].includes(offset)) return '';
+    return '';
+  };
+
+  const SyncedChartRow = ({ offset, height = 220, showX = false }: { offset: string, height?: number, showX?: boolean }) => {
+    const isBinary = ['offset_9', 'sino', 'offset_21'].includes(offset);
+    const currentValue = syncedData[syncedData.length - 1]?.[offset] || 0;
+    
+    // Escalas fixas para pressões
+    const domain = (['offset_11', 'offset_3', 'offset_7', 'offset_14'].includes(offset)) ? [0, 100] : 
+                   (offset === 'offset_4') ? [0, 120] : ['auto', 'auto'];
+    return (
+      <div className={`multi-chart-grid ${isBinary ? 'h-[120px]' : 'h-[240px]'}`}>
+        <div className="chart-label-container" style={{ borderLeftColor: COLORS[offset] || '#475569' }}>
+          <p className="text-[10px] text-slate-500 uppercase font-black mb-1">CANAL</p>
+          <h3 className="text-sm font-bold text-white mb-2">{CHANNEL_NAMES[offset] || offset.toUpperCase()}</h3>
+          <div className="flex items-baseline gap-2 mt-auto">
+            {isBinary ? (
+              <span className={`px-3 py-1 rounded-full text-[10px] font-black uppercase ${currentValue === 1 ? 'bg-emerald-500/20 text-emerald-400' : 'bg-slate-800 text-slate-500'}`}>
+                {currentValue === 1 ? 'LIGADO' : 'DESLIGADO'}
+              </span>
+            ) : (
+              <>
+                <span className="text-2xl font-black leading-none" style={{ color: COLORS[offset] }}>
+                  {currentValue}
+                </span>
+                <span className="text-[10px] text-slate-500 font-bold uppercase">{getUnit(offset)}</span>
+              </>
+            )}
+          </div>
+        </div>
+        <div className="flex-1 bg-slate-900/40 rounded-[1.5rem] p-4 relative overflow-hidden">
+          <ResponsiveContainer width="100%" height="100%">
+            <LineChart data={syncedData} syncId="wabtec" onMouseMove={(e) => e.activePayload && setHoverIndex(e.activePayload[0].payload.index)}>
+              <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.02)" vertical={false} />
+              <XAxis 
+                dataKey="timestamp" 
+                hide={!showX} 
+                stroke="rgba(255,255,255,0.1)" 
+                tick={{fill: 'rgba(255,255,255,0.3)', fontSize: 9}}
+                minTickGap={60}
+              />
+              <YAxis 
+                stroke="rgba(255,255,255,0.1)" 
+                tick={{fill: 'rgba(255,255,255,0.3)', fontSize: 10}} 
+                domain={domain as any}
+                width={35}
+                hide={isBinary}
+              />
+              <Tooltip 
+                contentStyle={{ backgroundColor: '#0f172a', border: '1px solid rgba(255,255,255,0.1)', borderRadius: '12px' }}
+                itemStyle={{ color: COLORS[offset] || '#fff', fontWeight: 'bold', fontSize: '12px' }}
+                labelStyle={{ color: '#64748b', fontSize: '10px', marginBottom: '4px' }}
+              />
+              <Line 
+                type={isBinary ? "stepAfter" : "monotone"} 
+                dataKey={offset} 
+                stroke={COLORS[offset] || '#475569'} 
+                strokeWidth={isBinary ? 2 : 3} 
+                dot={false}
+                activeDot={{ r: 6, fill: COLORS[offset] || '#fff', stroke: '#020617', strokeWidth: 2 }}
+              />
+            </LineChart>
+          </ResponsiveContainer>
+        </div>
+      </div>
+    );
+  };
 
   return (
-    <div className="h-screen w-screen flex flex-col bg-bg-base text-text-main font-sans overflow-hidden">
-      {/* Header */}
-      <header className="h-[60px] border-b border-border-subtle flex items-center justify-between px-6 bg-bg-base shrink-0">
-        <div className="font-bold tracking-tight flex items-center gap-2 text-lg">
-          Auditor de <span className="text-accent underline decoration-accent/30 underline-offset-4">Telemetria</span>
+    <div className="min-h-screen bg-[#020617] text-slate-100 p-8 font-sans scroll-smooth">
+      <InfractionModal 
+        isOpen={isModalOpen} 
+        onClose={() => setIsModalOpen(false)} 
+        infractions={auditResults?.events || []}
+        totalSamples={syncedData.length}
+      />
+
+      {/* Header Premium */}
+      <header className="flex justify-between items-center mb-10 border-b border-white/5 pb-8">
+        <div className="flex items-center gap-6">
+          <div className="w-16 h-16 bg-gradient-to-br from-blue-600 to-indigo-700 rounded-2xl flex items-center justify-center shadow-2xl shadow-blue-500/20 cursor-pointer" onClick={() => setFileData(null)}>
+            <Train size={36} className="text-white" />
+          </div>
+          <div>
+            <div className="flex items-center gap-2 mb-3">
+              <span className="px-2 py-0.5 bg-blue-500/10 text-blue-400 text-[10px] font-bold uppercase tracking-widest rounded-full border border-blue-500/20">
+                Monitoramento em Tempo Real
+              </span>
+            </div>
+            <div className="flex items-center gap-6">
+              <h1 className="text-4xl font-black tracking-tight text-white uppercase italic">Painel-Rot</h1>
+              
+              <div className="flex items-center gap-3">
+                <button 
+                  onClick={() => setShowDebug(!showDebug)}
+                  className={`px-4 py-2 rounded-full text-[10px] font-black transition-all ${showDebug ? 'bg-orange-500 text-white shadow-[0_0_15px_rgba(249,115,22,0.4)]' : 'bg-white/5 text-slate-400 hover:bg-white/10'}`}
+                >
+                  {showDebug ? 'MODO ENGENHARIA ATIVO' : 'CALIBRAR OFFSETS'}
+                </button>
+                <div className="px-6 py-2 bg-blue-600/20 border border-blue-500/30 rounded-full">
+                  <span className="text-blue-400 text-[10px] font-black tracking-widest animate-pulse uppercase">
+                    MODO EVO ATIVO: {Object.values(fileData)[0]?.length || 0} AMOSTRAS
+                  </span>
+                </div>
+              </div>
+            </div>
+          </div>
         </div>
-        <div className="text-[11px] font-medium px-3 py-1 bg-accent/10 text-accent rounded-full border border-accent/20 flex items-center gap-2">
-          <ShieldCheck className="w-3.5 h-3.5" />
-          Análise Matemática • Auditoria Técnica
+        
+        {/* Navigation Tabs */}
+        <nav className="flex bg-slate-900/50 p-1.5 rounded-2xl border border-white/5 mx-8">
+          <button 
+            onClick={() => setActiveTab('telemetry')}
+            className={`flex items-center gap-2 px-6 py-2.5 rounded-xl text-sm font-bold transition-all ${activeTab === 'telemetry' ? 'bg-blue-600 text-white shadow-lg shadow-blue-600/20' : 'text-slate-400 hover:text-white'}`}
+          >
+            <Activity size={18} /> Telemetria
+          </button>
+          <button 
+            onClick={() => setActiveTab('compliance')}
+            className={`flex items-center gap-2 px-6 py-2.5 rounded-xl text-sm font-bold transition-all ${activeTab === 'compliance' ? 'bg-blue-600 text-white shadow-lg shadow-blue-600/20' : 'text-slate-400 hover:text-white'}`}
+          >
+            <ShieldCheck size={18} /> Auditoria de Condução
+          </button>
+        </nav>
+
+        <div className="flex gap-4">
+           {/* Seletores de Tempo */}
+           <div className="flex bg-white/5 p-1 rounded-xl border border-white/5 items-center px-3 gap-4">
+             <div className="flex items-center gap-2">
+               <Clock size={14} className="text-blue-400" />
+               <span className="text-[10px] font-bold text-slate-500 uppercase">Início Log:</span>
+               <input 
+                 type="text" 
+                 value={fileStartTime} 
+                 onChange={(e) => setFileStartTime(e.target.value)}
+                 className="bg-transparent border-b border-blue-500/30 text-xs font-mono w-20 focus:outline-none focus:border-blue-500 text-center"
+               />
+             </div>
+             <div className="w-px h-4 bg-white/10" />
+             <div className="flex items-center gap-2">
+               <History size={14} className="text-emerald-400" />
+               <span className="text-[10px] font-bold text-slate-500 uppercase">Janela:</span>
+               <input 
+                 type="text" 
+                 value={auditWindow.start} 
+                 onChange={(e) => setAuditWindow({...auditWindow, start: e.target.value})}
+                 className="bg-transparent border-b border-emerald-500/30 text-xs font-mono w-20 focus:outline-none focus:border-emerald-500 text-center"
+               />
+               <span className="text-[10px] text-slate-600">até</span>
+               <input 
+                 type="text" 
+                 value={auditWindow.end} 
+                 onChange={(e) => setAuditWindow({...auditWindow, end: e.target.value})}
+                 className="bg-transparent border-b border-emerald-500/30 text-xs font-mono w-20 focus:outline-none focus:border-emerald-500 text-center"
+               />
+             </div>
+           </div>
+
+           {/* View Mode Switcher */}
+          <div className="flex bg-white/5 p-1 rounded-xl border border-white/5 mr-4">
+            <button 
+              onClick={() => setViewMode('single')}
+              className={`px-4 py-1.5 rounded-lg text-[10px] font-black uppercase tracking-wider transition-all ${viewMode === 'single' ? 'bg-blue-600 text-white' : 'text-slate-500 hover:text-slate-300'}`}
+            >
+              Único
+            </button>
+            <button 
+              onClick={() => setViewMode('multi')}
+              className={`px-4 py-1.5 rounded-lg text-[10px] font-black uppercase tracking-wider transition-all ${viewMode === 'multi' ? 'bg-blue-600 text-white' : 'text-slate-500 hover:text-slate-300'}`}
+            >
+              Multi
+            </button>
+          </div>
+
+          <button className="bg-white/5 border border-white/10 hover:bg-white/10 text-white px-6 py-3 rounded-2xl font-bold flex items-center gap-3 transition-all">
+            <FileText size={20} />
+            Gerar Parecer
+          </button>
         </div>
       </header>
 
-      {/* Main Grid */}
-      <main className="flex-1 flex flex-col lg:grid lg:grid-cols-[280px_1fr_320px] gap-[1px] bg-border-subtle overflow-y-auto lg:overflow-hidden relative">
-        
-        {/* Panel 1: Controls */}
-        <section className="bg-bg-base p-6 flex flex-col shrink-0 lg:overflow-y-auto lg:h-full border-b lg:border-b-0 lg:border-r border-border-subtle">
-          <div className="mb-6">
-            <h3 className="text-[11px] uppercase text-text-dim tracking-wider mb-3 flex items-center gap-2 font-bold">
-              <ScanLine className="w-4 h-4 text-accent" />
-              Guia de Funções
-            </h3>
-            <div className="space-y-3 p-3 bg-card-base rounded-lg border border-border-subtle text-[11px] leading-relaxed text-text-dim">
-              <p>1. <strong className="text-text-main">Binário .DAT</strong>: Decodifica o arquivo bruto da Wabtec. Identifica falhas diretamente nos dados numéricos.</p>
-              <p>2. <strong className="text-text-main">Scanner Óptico</strong>: Analisa visualmente a linha azul de velocidade no gráfico para detectar quedas bruscas.</p>
-              <p>3. <strong className="text-text-main">Marcação Manual</strong>: Use o modo edição para "ensinar" pontos específicos do gráfico para o relatório.</p>
-            </div>
-          </div>
-
-          <div className="mb-6">
-             <button 
-                onClick={() => setIsEditMode(!isEditMode)}
-                className={`w-full flex items-center justify-center gap-2 py-2.5 rounded-md text-[11px] font-bold uppercase tracking-wider transition-all border ${isEditMode ? 'bg-accent text-bg-base border-accent shadow-[0_0_15px_rgba(34,211,238,0.3)]' : 'bg-card-base text-text-main border-border-subtle hover:border-accent'}`}
-              >
-                {isEditMode ? 'Finalizar Marcações' : 'Modo Auditor (Marcar Pontos)'}
-              </button>
-              {isEditMode && (
-                <p className="text-[9px] text-accent mt-2 animate-pulse text-center font-mono uppercase">
-                   Clique no gráfico para inserir uma nota técnica
-                </p>
-              )}
-          </div>
-
-          <div className="flex items-center justify-between mb-4 pb-2 border-b border-border-subtle">
-            <h3 className="text-[12px] uppercase text-text-dim tracking-[1.5px] flex items-center gap-1.5 font-bold">
-              Configuração
-            </h3>
-          </div>
-          
-          <div className="flex-1 flex flex-col gap-4">
-            <div className="bg-card-base p-1 border border-border-subtle rounded-md flex flex-wrap gap-1">
-              <button 
-                onClick={() => setEngineMode('DAT')}
-                className={`flex-1 min-w-[70px] text-[10px] font-bold uppercase tracking-wider py-2 rounded-[4px] transition-colors ${engineMode === 'DAT' ? 'bg-accent text-bg-base' : 'text-text-dim hover:text-text-main'}`}
-              >
-                Binário .DAT
-              </button>
-              <button 
-                onClick={() => setEngineMode('OPTICAL')}
-                className={`flex-1 min-w-[70px] text-[10px] font-bold uppercase tracking-wider py-2 rounded-[4px] transition-colors flex items-center justify-center gap-1 ${engineMode === 'OPTICAL' ? 'bg-accent text-bg-base' : 'text-text-dim hover:text-text-main'}`}
-              >
-                <ScanLine className="w-3 h-3" /> Scanner Óptico
-              </button>
-              <button 
-                onClick={() => setEngineMode('RULES')}
-                className={`flex-1 min-w-[140px] text-[10px] font-bold uppercase tracking-wider py-2 rounded-[4px] transition-colors flex items-center justify-center gap-1 mt-1 lg:mt-0 ${engineMode === 'RULES' ? 'bg-purple-500 text-bg-base' : 'text-text-dim hover:text-text-main'}`}
-              >
-                <BookOpen className="w-3 h-3" /> Diretrizes (PDF/PDS)
-              </button>
-            </div>
-
-            {engineMode === 'RULES' && (
-              <div className="space-y-4 animate-in fade-in slide-in-from-top-2 duration-300">
-                <Uploader
-                  label="PROCEDIMENTO / DBO (.PDF, .TXT)"
-                  accept=".pdf,.txt,.doc,.docx"
-                  multiple={false}
-                  files={ruleFile ? [ruleFile] : []}
-                  onUpload={(files) => {
-                    setRuleFile(files[0]);
-                    // Simulated extraction delay
-                    setTimeout(() => {
-                      setExtractedRules([
-                        { tag: "TESTE_MARCHA_MAX_V", value: 10, unit: "km/h", source: "Regra 2" },
-                        { tag: "TEMPO_REDUCAO_MIN", value: 20, unit: "s", source: "Glossário DBO" },
-                        { tag: "APL_SERVICO_MAX", value: 18, unit: "PSI", source: "Limites Técnicos" }
-                      ]);
-                    }, 1200);
-                  }}
-                  onRemove={() => { setRuleFile(null); setExtractedRules(null); }}
-                  helperText="O sistema extrairá as variáveis contidas no documento."
-                />
-
-                <Uploader
-                  label="GABARITO / REFERÊNCIA (CERTO/ERRADO)"
-                  accept=".png,.jpg,.jpeg"
-                  multiple={false}
-                  files={referenceFile ? [referenceFile] : []}
-                  onUpload={(files) => setReferenceFile(files[0])}
-                  onRemove={() => setReferenceFile(null)}
-                  helperText="Use um print de 'Condução Nota 10' ou 'Falha Típica' para comparar."
-                />
+      {/* Seção de Calibração (Debug) */}
+      {showDebug && fileData && (
+        <div className="mb-12 p-8 bg-orange-500/5 border border-orange-500/20 rounded-[2.5rem] backdrop-blur-xl">
+           <div className="flex justify-between items-center mb-6">
+              <div>
+                <h3 className="text-orange-500 font-black italic uppercase tracking-tighter text-xl">Painel de Calibração Raw</h3>
+                <p className="text-slate-500 text-xs">Passe o mouse no gráfico para ver os valores brutos de cada offset (0-42)</p>
               </div>
-            )}
-
-            <Uploader
-              label="FITA GRÁFICA (.PNG/.JPG)"
-              accept=".png,.jpg,.jpeg"
-              multiple={false}
-              files={imageFile ? [imageFile] : []}
-              onUpload={(files) => setImageFile(files[0])}
-              onRemove={() => setImageFile(null)}
-              helperText="Referência visual para marcação"
-            />
-
-            <Uploader
-              label="TELEMETRIA (.DAT)"
-              accept=".dat,.csv,.txt,application/octet-stream,*/*"
-              multiple={false}
-              files={dataFile ? [dataFile] : []}
-              onUpload={(files) => setDataFile(files[0])}
-              onRemove={() => setDataFile(null)}
-              helperText="Log numérico (Opcional)"
-            />
-          </div>
-
-          <div className="pt-4 mt-auto">
-            <button
-              onClick={handleRunAnalysis}
-              disabled={isButtonDisabled}
-              className="w-full flex items-center justify-center gap-2 bg-accent hover:bg-accent/80 text-bg-base disabled:opacity-50 py-3 px-4 rounded-[6px] text-[13px] font-bold transition-all uppercase tracking-wider"
-            >
-              <ShieldCheck className="w-4 h-4" />
-              {isAnalyzing ? "PROCESSANDO..." : "AUDITAR TELEMETRIA"}
-            </button>
-          </div>
-        </section>
-
-        {/* Panel 2: Canvas Area */}
-        <section className="bg-[#000] relative flex flex-col items-center justify-center overflow-hidden flex-1 shrink-0 p-2 group min-h-[50vh] lg:min-h-0 lg:h-full">
-          
-          {/* Zoom Toolbar */}
-          {imageFile && (
-            <div className="absolute top-4 right-4 z-[60] flex gap-2 bg-[#111]/90 backdrop-blur-md p-1.5 rounded-lg border border-border-subtle opacity-0 group-hover:opacity-100 transition-opacity">
-              <button onClick={handleZoomOut} disabled={scale === 1} className="p-1.5 text-text-dim hover:text-accent disabled:opacity-30 rounded transition-colors" title="Afastar">
-                <ZoomOut className="w-4 h-4" />
-              </button>
-              <button onClick={handleResetZoom} className="p-1.5 text-text-main hover:text-accent font-mono text-[10px] w-12 flex items-center justify-center transition-colors" title="Resetar">
-                {(scale * 100).toFixed(0)}%
-              </button>
-              <button onClick={handleZoomIn} disabled={scale >= 4} className="p-1.5 text-text-dim hover:text-accent disabled:opacity-30 rounded transition-colors" title="Aproximar">
-                <ZoomIn className="w-4 h-4" />
-              </button>
-            </div>
-          )}
-
-          <div 
-            ref={containerRef}
-            onMouseDown={onMouseDown}
-            onMouseLeave={onMouseLeave}
-            onMouseUp={onMouseUp}
-            onMouseMove={onMouseMove}
-            onMouseEnter={() => setShowRuler(true)}
-            className="w-full h-full bg-[#0a0a0a] border border-border-subtle relative overflow-auto rounded-lg hide-scrollbar cursor-crosshair"
-          >
-            {/* Vertical Ruler */}
-            {showRuler && imageFile && (
-              <div 
-                className="absolute top-0 bottom-0 w-[1px] bg-accent/60 z-50 pointer-events-none shadow-[0_0_10px_rgba(34,211,238,0.5)]"
-                style={{ left: mousePos.x }}
-              >
-                <div className="absolute top-0 left-2 bg-accent/90 text-bg-base text-[9px] font-bold px-1.5 py-0.5 rounded-sm uppercase tracking-tighter">
-                  RÉGUA DE AUDITORIA
-                </div>
+              <div className="text-right">
+                <span className="block text-[10px] text-slate-500 uppercase font-bold">Amostra Atual</span>
+                <span className="text-2xl font-mono font-black text-orange-500">#{hoverIndex ?? 0}</span>
               </div>
-            )}
-
-            {!imageFile ? (
-               <div className="absolute inset-0 flex flex-col items-center justify-center pointer-events-none">
-                 <FileSearch className="w-10 h-10 text-accent/20 mb-4" />
-                 <div className="font-mono text-[11px] text-text-dim uppercase tracking-wider text-center">
-                    Arraste o gráfico para começar<br/>
-                    <span className="opacity-50 text-[9px] mt-1 block">A auditoria é puramente técnica e offline</span>
-                 </div>
-               </div>
-            ) : (
-               <div className="min-w-full min-h-full flex items-center justify-center p-4">
-                 <div 
-                    className="relative transition-all duration-300 pointer-events-auto"
-                    style={{ height: `${scale * 60}vh`, minWidth: '100%' }}
-                  >
-                    <img 
-                      src={URL.createObjectURL(imageFile)} 
-                      alt="Target graph" 
-                      className={`h-full w-auto object-contain block select-none pointer-events-none transition-opacity ${isEditMode ? 'opacity-90' : 'opacity-100'}`}
-                      referrerPolicy="no-referrer"
-                    />
-
-                    {/* Interaction layer for clicks */}
-                    <div 
-                      className={`absolute inset-0 z-30 ${isEditMode ? 'cursor-crosshair' : 'pointer-events-none'}`}
-                      onClick={handleImageClick}
-                    ></div>
-                    
-                    {/* Hotspots (Automatic + Manual) */}
-                    <div className="absolute inset-0 z-20 pointer-events-none">
-                      {/* Pontos Autogerados pelo Scanner Óptico */}
-                      {[...(result?.pointsOfAttention || []), ...manualPoints].map((point: any, idx: number) => {
-                         if (point.visualX !== undefined && point.visualY !== undefined && !isNaN(point.visualX) && !isNaN(point.visualY)) {
-                            const isManual = point.isManual;
-                            const isHighSeverity = point.severity === 'HIGH';
-                            return (
-                               <div 
-                                  key={`opt-${idx}`}
-                                  className="absolute flex flex-col items-center pointer-events-none"
-                                  style={{ top: `${point.visualY}%`, left: `${point.visualX}%`, transform: 'translate(-50%, -50%)' }}
-                               >
-                                  {/* The Circle */}
-                                  <div 
-                                     className={`w-6 h-6 rounded-full border-2 animate-pulse ${isManual ? 'border-yellow-400 bg-yellow-400/30' : (isHighSeverity ? 'border-red-500 bg-red-500/30' : 'border-accent bg-accent/30')}`}
-                                  ></div>
-                                  
-                                  {/* The Label */}
-                                  <div className={`mt-1 text-[8px] font-bold px-1.5 py-0.5 rounded uppercase whitespace-nowrap ${isManual ? 'bg-yellow-400 text-black' : (isHighSeverity ? 'bg-red-500 text-white' : 'bg-accent text-black')}`}>
-                                      {point.channel || 'MARCAÇÃO'}
-                                  </div>
-                               </div>
-                            );
-                         }
-                         return null;
-                      })}
-                    </div>
-
-                    {/* Pending Point Form */}
-                    {pendingPoint && (
-                      <div 
-                        className="absolute z-50 bg-card-base border border-accent p-4 rounded-xl shadow-2xl w-[260px] pointer-events-auto"
-                        style={{ top: `${pendingPoint.y}%`, left: `${pendingPoint.x}%`, transform: 'translate(-50%, -120%)' }}
-                      >
-                         <h5 className="text-[10px] font-bold uppercase text-accent mb-3 border-b border-border-subtle pb-1">Analisar Ponto Manual</h5>
-                         <div className="space-y-3">
-                            <input 
-                               placeholder="Canal (Ex: Freio, Motor...)" 
-                               id="manual-type"
-                               className="w-full bg-bg-base border border-border-subtle p-2 text-[11px] rounded"
-                            />
-                            <textarea 
-                               placeholder="Descrição da irregularidade..." 
-                               id="manual-desc"
-                               className="w-full bg-bg-base border border-border-subtle p-2 text-[11px] rounded h-16"
-                            />
-                            <select id="manual-sev" className="w-full bg-bg-base border border-border-subtle p-2 text-[11px] rounded">
-                               <option value="LOW">Severidade: BAIXA</option>
-                               <option value="MEDIUM">Severidade: MÉDIA</option>
-                               <option value="HIGH">Severidade: ALTA</option>
-                            </select>
-                            <div className="flex gap-2">
-                               <button 
-                                 onClick={() => setPendingPoint(null)}
-                                 className="flex-1 py-1.5 text-[10px] uppercase font-bold border border-border-subtle rounded hover:bg-red-500/10"
-                               >Cancelar</button>
-                               <button 
-                                 onClick={() => {
-                                    const type = (document.getElementById('manual-type') as HTMLInputElement).value || "Evento Manual";
-                                    const desc = (document.getElementById('manual-desc') as HTMLTextAreaElement).value || "Sem descrição.";
-                                    const sev = (document.getElementById('manual-sev') as HTMLSelectElement).value;
-                                    addManualPoint(type, desc, sev);
-                                 }}
-                                 className="flex-1 py-1.5 text-[10px] uppercase font-bold bg-accent text-bg-base rounded"
-                               >Marcar</button>
-                            </div>
-                         </div>
-                      </div>
-                    )}
+           </div>
+           
+           <div className="grid grid-cols-8 gap-2">
+              {Array.from({ length: 43 }).map((_, i) => {
+                const offset = `offset_${i}`;
+                const val = fileData[offset]?.[hoverIndex ?? 0] ?? 0;
+                const isMapped = !!CHANNEL_CONFIG[offset];
+                return (
+                  <div key={i} className={`p-3 rounded-xl border ${isMapped ? 'bg-blue-500/10 border-blue-500/20' : 'bg-white/5 border-white/5'} flex flex-col items-center justify-center`}>
+                    <span className="text-[9px] text-slate-500 font-bold">OFF_{i}</span>
+                    <span className={`text-lg font-mono font-black ${isMapped ? 'text-blue-400' : 'text-slate-300'}`}>{val}</span>
                   </div>
-               </div>
-            )}
-          </div>
-          
-          {imageFile && (
-            <div className="absolute bottom-5 left-5 font-mono text-[10px] text-text-dim uppercase z-20 bg-[#000]/80 p-2 rounded border border-border-subtle pointer-events-none ring-1 ring-accent/20">
-              MODO AUTÔNOMO: {engineMode === 'OPTICAL' ? 'SCANNER ÓPTICO' : 'LEITOR DE METADADOS .DAT'}
+                );
+              })}
+           </div>
+        </div>
+      )}
+
+      {activeTab === 'telemetry' ? (
+        <div className="animate-in fade-in duration-500">
+          {viewMode === 'multi' ? (
+            <div className="space-y-6">
+              {ESSENTIAL_CHANNELS.map((offset, idx) => (
+                <SyncedChartRow 
+                  key={offset} 
+                  offset={offset} 
+                  showX={idx === ESSENTIAL_CHANNELS.length - 1} 
+                />
+              ))}
+            </div>
+          ) : (
+            <div className="grid grid-cols-12 gap-8">
+               <div className="col-span-3 space-y-8">
+                <div className="bg-slate-900/40 border border-white/5 rounded-3xl p-6 backdrop-blur-xl">
+                  <h2 className="font-bold mb-6 flex items-center gap-2 opacity-80 uppercase tracking-tighter">
+                    <LayoutDashboard size={18} /> Sumário de Dados
+                  </h2>
+                  <div className="space-y-4">
+                    <div className="p-4 bg-white/5 rounded-2xl border border-white/5">
+                      <p className="text-[10px] text-slate-500 uppercase font-black mb-1">Amostras</p>
+                      <p className="text-2xl font-black">{syncedData.length}</p>
+                    </div>
+                  </div>
+                  
+                  <div className="flex items-center gap-4 mt-6">
+                    <button 
+                      onClick={() => setShowDebug(!showDebug)}
+                      className={`px-4 py-2 rounded-full text-[10px] font-black transition-all ${showDebug ? 'bg-orange-500 text-white shadow-[0_0_15px_rgba(249,115,22,0.4)]' : 'bg-white/5 text-slate-400 hover:bg-white/10'}`}
+                    >
+                      {showDebug ? 'MODO ENGENHARIA ATIVO' : 'CALIBRAR OFFSETS'}
+                    </button>
+                  </div>
+                </div>
+
+                <div className="bg-slate-900/40 border border-white/5 rounded-3xl p-6">
+                  <h2 className="font-bold mb-4 flex items-center gap-2 opacity-80 uppercase tracking-tighter">
+                    <Database size={18} /> Seletor de Sinal
+                  </h2>
+                  <div className="space-y-2 max-h-[400px] overflow-y-auto pr-2 custom-scrollbar">
+                    {Object.keys(fileData).map(offset => (
+                      <button 
+                        key={offset}
+                        onClick={() => setSelectedOffset(offset)}
+                        className={`w-full text-left px-4 py-2.5 rounded-xl text-xs font-bold transition-all border ${selectedOffset === offset ? 'bg-blue-600/20 border-blue-500/50 text-white' : 'bg-white/5 border-transparent text-slate-400 hover:border-white/10 hover:text-white'}`}
+                      >
+                        {CHANNEL_NAMES[offset] || `Canal ${offset.split('_')[1]}`}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              </div>
+
+              <div className="col-span-9">
+                 <SyncedChartRow offset={selectedOffset} height={500} showX={true} />
+              </div>
             </div>
           )}
-        </section>
-
-        {/* Panel 3: Results */}
-        <section className="bg-bg-base p-5 flex flex-col shrink-0 lg:overflow-y-auto lg:h-full pb-20 lg:pb-5">
-          <h3 className="text-[12px] uppercase text-text-dim tracking-[1.5px] mb-4 flex items-center gap-2">
-            REGISTROS ENCONTRADOS {(result?.pointsOfAttention?.length || 0) > 0 ? `(${result?.pointsOfAttention?.length})` : ''}
-          </h3>
-
-          {/* Results Area */}
-          <div className="flex flex-col gap-3">
-            {error && (
-              <div className="p-4 rounded-lg bg-red-500/10 border border-red-500/50 text-red-500 text-[11px] font-medium text-center">
-                {error}
-              </div>
-            )}
-
-            {!result && !isAnalyzing && (
-              <div className="flex flex-col items-center justify-center py-12 text-center border border-dashed border-border-subtle rounded-xl opacity-60">
-                <FileSearch className="w-8 h-8 mb-3 text-accent/40" />
-                <p className="text-[10px] uppercase tracking-wide px-4 font-mono text-text-dim">
-                   Aguardando Início da Auditoria
-                </p>
-              </div>
-            )}
-
-            {isAnalyzing && (
-              <div className="flex flex-col items-center justify-center py-12 text-center bg-card-base border border-border-subtle rounded-xl">
-                <div className="w-6 h-6 border-2 border-accent border-t-transparent rounded-full animate-spin mb-3"></div>
-                <p className="text-[10px] uppercase tracking-wide font-mono text-accent">
-                   Processando Dados...
-                </p>
-              </div>
-            )}
-
-            {/* Rules Extraction View */}
-            {engineMode === 'RULES' && extractedRules && (
-              <div className="mb-4 animate-in slide-in-from-bottom-4">
-                <div className="flex items-center justify-between mb-3">
-                  <h4 className="text-[10px] uppercase text-text-dim tracking-wider font-bold flex items-center gap-2">
-                    <Settings className="w-3.5 h-3.5 text-purple-400" />
-                    Parâmetros Extraídos do PDS
-                  </h4>
-                  <span className="text-[9px] bg-purple-500/10 text-purple-400 px-2 py-0.5 rounded font-mono border border-purple-500/20">
-                     VINCULADO AO MOTOR (.DAT)
-                  </span>
-                </div>
-                <div className="bg-card-base border border-border-subtle rounded-lg overflow-hidden">
-                  <table className="w-full text-left border-collapse">
-                    <thead>
-                      <tr className="bg-bg-base border-b border-border-subtle">
-                        <th className="p-2 text-[9px] font-mono text-text-dim uppercase tracking-wider">Variável (Tag)</th>
-                        <th className="p-2 text-[9px] font-mono text-text-dim uppercase tracking-wider">Valor Limite</th>
-                        <th className="p-2 text-[9px] font-mono text-text-dim uppercase tracking-wider">Origem no Texto</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {extractedRules.map((rule, idx) => (
-                        <tr key={idx} className="border-b border-border-subtle last:border-0 hover:bg-bg-base transition-colors">
-                          <td className="p-2 py-3 text-[10px] font-bold text-text-main font-mono">{rule.tag}</td>
-                          <td className="p-2 py-3 text-[11px] text-purple-400 font-mono">
-                            {rule.value} <span className="text-text-dim text-[10px]">{rule.unit}</span>
-                          </td>
-                          <td className="p-2 py-3 text-[10px] text-text-dim italic">{rule.source}</td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-                <div className="mt-3 p-3 bg-purple-500/5 border border-purple-500/20 rounded-lg text-[10px] text-text-dim leading-relaxed">
-                  <strong className="text-purple-400">Como funciona:</strong> O sistema mapeou o texto do procedimento e substituiu as variáveis padrão. As próximas análises do <strong>Scanner .DAT</strong> utilizarão esses tetos numéricos e temporais como limite inegociável.
-                </div>
-              </div>
-            )}
-
-            {/* Checklist View (Specific for DAT/Vale Rules) */}
-            {result?.checklist && (
-              <div className="mb-4">
-                <h4 className="text-[10px] uppercase text-text-dim tracking-wider font-bold mb-2">Checklist da Operação</h4>
-                <div className="space-y-1.5">
-                  {result.checklist.map((item: any, idx: number) => (
-                    <div key={idx} className="bg-card-base border border-border-subtle p-3 rounded-lg">
-                      <div className="flex items-center justify-between mb-1">
-                        <span className="text-[11px] font-bold text-text-main">{item.item}</span>
-                        <span className={`text-[10px] font-mono px-2 py-0.5 rounded leading-none ${
-                          item.status === 'OK' ? 'bg-green-500/10 text-green-500 border border-green-500/20' :
-                          item.status === 'FALHA' ? 'bg-red-500/10 text-red-500 border border-red-500/20' :
-                          item.status === 'NA' ? 'bg-gray-500/10 text-text-dim border border-border-subtle' :
-                          'bg-yellow-500/10 text-yellow-500 border border-yellow-500/20'
-                        }`}>
-                          {item.status}
+        </div>
+      ) : (
+        /* Aba de Conformidade de Condução */
+        <div className="grid grid-cols-12 gap-8 animate-in slide-in-from-bottom duration-500">
+           <div className="col-span-4 space-y-8">
+              <div className="bg-slate-900/40 border border-white/5 rounded-[2.5rem] p-8">
+                <h2 className="text-2xl font-black mb-8 flex items-center gap-3">
+                  <ShieldCheck size={28} className="text-emerald-500" />
+                  Conformidade Operacional
+                </h2>
+                
+                <div className="space-y-4">
+                  {[
+                    { id: 'arrancada', name: 'Arrancada Segura', desc: 'EG 88-90 PSI, Buzina prévia e Sino ligado.', ok: auditResults?.compliance.arrancada_segura },
+                    { id: 'reducao_forte', name: 'Redução Strong (<18 PSI)', desc: 'Evita choques bruscos na composição.', ok: auditResults?.compliance.reducao_forte },
+                    { id: 'alivio_rodagem', name: 'Alívio de Rodagem', desc: 'Não aliviar com V < 16 km/h.', ok: auditResults?.compliance.alivio_rodagem },
+                    { id: 'teste_marcha', name: 'Teste de Marcha', desc: 'V < 10 km/h, Notch 1-3, queda 6-8 PSI.', ok: auditResults?.compliance.teste_marcha },
+                    { id: 'emergencia', name: 'Procedimento Emergência', desc: 'Siga o protocolo de 6 pontos de segurança.', ok: auditResults?.compliance.emergencia_correta }
+                  ].map(item => (
+                    <div key={item.id} className={`p-5 rounded-3xl border transition-all ${item.ok ? 'bg-emerald-500/5 border-emerald-500/20' : 'bg-red-500/5 border-red-500/20 shadow-lg shadow-red-500/5'}`}>
+                      <div className="flex justify-between items-start mb-2">
+                        <div className="flex items-center gap-3">
+                           <h3 className={`font-bold ${item.ok ? 'text-emerald-500' : 'text-red-500'}`}>{item.name}</h3>
+                        </div>
+                        <span className={`text-[9px] font-black uppercase px-2 py-0.5 rounded-full ${item.ok ? 'bg-emerald-500/20 text-emerald-500' : 'bg-red-500/20 text-red-500'}`}>
+                           {item.ok ? 'Conforme' : 'Violação'}
                         </span>
                       </div>
-                      <p className="text-[10px] text-text-dim leading-relaxed">{item.details}</p>
+                      <p className="text-[10px] text-slate-500 font-medium mb-3">{item.desc}</p>
+                      
+                      {/* Detalhamento do Checklist de Emergência se houver erro */}
+                      {item.id === 'emergencia' && (
+                        <div className="grid grid-cols-2 gap-2 mt-2 pt-3 border-t border-red-500/10">
+                          {[
+                            { label: 'EG 0 PSI', key: 'eg_zero' },
+                            { label: 'Amp 0', key: 'amp_zero' },
+                            { label: 'Indep. 72', key: 'indep_ok' },
+                            { label: 'Rev. Neutro', key: 'rev_neutro' },
+                            { label: 'Sino Off', key: 'sino_off' },
+                            { label: 'Notch 0', key: 'notch_zero' },
+                          ].map((check, i) => {
+                            const pass = (auditResults as any)?.summaryChecklist?.[check.key] ?? auditResults?.compliance.emergencia_correta;
+                            return (
+                              <div key={i} className="flex items-center gap-1.5">
+                                <div className={`w-1.5 h-1.5 rounded-full ${pass ? 'bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.5)]' : 'bg-red-500'}`} />
+                                <span className={`text-[9px] ${pass ? 'text-emerald-500/70 font-medium' : 'text-red-500 font-black'}`}>{check.label}</span>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      )}
                     </div>
                   ))}
                 </div>
               </div>
-            )}
+           </div>
 
-            {/* Main Alert List */}
-            {result && [...(result?.pointsOfAttention || []), ...manualPoints].map((point: any, idx: number) => (
-              <div 
-                key={idx}
-                id={`point-card-${idx}`}
-                className={`p-4 rounded-xl border transition-all hover:shadow-sm ${point.isManual ? 'border-yellow-400/50 bg-yellow-400/5' : 'border-border-subtle bg-card-base hover:border-accent'}`}
-              >
-                <div className="flex items-center justify-between mb-2 pb-2 border-b border-border-subtle/50">
-                  <span className={`text-[9px] font-mono uppercase tracking-tighter ${point.isManual ? 'text-yellow-500' : 'text-accent'}`}>
-                    {point.isManual ? 'AULA / MARCAÇÃO' : `REGISTRO #${String(idx + 1).padStart(2, '0')}`}
-                  </span>
-                  <span className="text-[10px] text-text-dim font-mono">{point.timestampOrSection}</span>
-                </div>
-                <h4 className="text-[12px] font-bold text-text-main mb-1 uppercase tracking-tight">{point.channel}</h4>
-                <p className="text-[11px] text-text-dim leading-relaxed">{point.description}</p>
-                {point.isManual && (
-                  <button 
-                    onClick={() => setManualPoints(prev => prev.filter(p => p !== point))}
-                    className="mt-3 text-[9px] font-bold uppercase text-red-500 hover:underline"
-                  >
-                    Remover marcação
-                  </button>
+           {/* Timeline de Eventos */}
+           <div className="col-span-8 bg-slate-900/40 border border-white/5 rounded-[2.5rem] p-10 backdrop-blur-xl">
+             <div className="flex justify-between items-center mb-10">
+                <h2 className="text-2xl font-black flex items-center gap-3 italic">
+                  <History size={26} className="text-blue-500" />
+                  Timeline de Eventos Detectados
+                </h2>
+                <span className="text-xs text-slate-500 font-mono">Mostrando: {filteredEvents.length} de {auditResults?.events.length || 0} eventos</span>
+             </div>
+
+             <div className="space-y-4 max-h-[600px] overflow-y-auto px-4 custom-scrollbar">
+                {filteredEvents.length ? filteredEvents.map((event, idx) => (
+                  <div key={idx} className="group relative flex gap-6 p-6 bg-white/5 hover:bg-white/10 border border-white/5 rounded-[1.8rem] transition-all cursor-crosshair">
+                     <div className="flex flex-col items-center">
+                        <div className={`w-3 h-3 rounded-full mt-2 ${event.severity === 'INFRAÇÃO' ? 'bg-red-500' : 'bg-blue-500'}`} />
+                        <div className="w-px h-full bg-white/10 mt-2" />
+                     </div>
+                     <div className="flex-1">
+                        <div className="flex justify-between items-center mb-2">
+                           <span className="text-[10px] font-mono text-slate-500 uppercase tracking-widest">
+                             {secondsToTime(timeToSeconds(fileStartTime) + event.timestamp)}
+                           </span>
+                           <span className={`text-[9px] font-black px-2 py-0.5 rounded shadow-sm ${event.severity === 'INFRAÇÃO' ? 'bg-red-600 text-white' : 'bg-blue-600 text-white'}`}>
+                              {event.type.replace('_', ' ')}
+                           </span>
+                        </div>
+                        <p className="text-sm font-bold text-slate-200 group-hover:text-white transition-colors">{event.description}</p>
+                     </div>
+                     <ChevronRight size={20} className="text-slate-800 group-hover:text-blue-500 transition-all self-center" />
+                  </div>
+                )) : (
+                  <div className="flex flex-col items-center justify-center py-20 text-slate-600">
+                     <ShieldCheck size={64} className="opacity-10 mb-4" />
+                     <p className="text-lg font-black uppercase tracking-tighter italic">Nenhuma anomalia na janela selecionada</p>
+                  </div>
                 )}
-              </div>
-            ))}
-          </div>
-        </section>
-      </main>
-
-      {/* Footer */}
-      <footer className="h-[34px] bg-card-base border-t border-border-subtle flex gap-5 items-center px-6 font-mono text-[9px] text-text-dim shrink-0">
-        <div>CURSOR: <span className="text-accent underline">X:{mousePos.x.toFixed(0)} Y:{mousePos.y.toFixed(0)}</span></div>
-        <div>SISTEMA: <span className="text-accent">DETERMINÍSTICO</span></div>
-        <div className="ml-auto uppercase text-accent/50">Railway Auditor Pro // v2.0-offline-mode</div>
-      </footer>
+             </div>
+           </div>
+        </div>
+      )}
     </div>
   );
-}
+};
+
+export default App;
