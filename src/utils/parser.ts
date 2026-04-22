@@ -71,12 +71,12 @@ export const parseWabtecBinary = (buffer: ArrayBuffer): TelemetryData => {
     // Busca por Tags
     // EG (&BA)
     if (data[i] === TAGS.EG[0] && data[i+1] === TAGS.EG[1] && data[i+2] === TAGS.EG[2]) {
-      lastValues.eg = data[i+3] - 64; // Fórmula: Byte - 64
+      lastValues.eg = (data[i+3] - 64) * 0.625; // Escala 0-160 PSI (142 * 0.625 = 88.75)
       i += 3;
     }
     // BC (ДиК)
     else if (data[i] === TAGS.BC[0] && data[i+1] === TAGS.BC[1] && data[i+2] === TAGS.BC[2]) {
-      lastValues.bc = data[i+3]; // Assumindo valor bruto por enquanto
+      lastValues.bc = data[i+3] - 64; // Offset calibrado para PSI real (134 -> 70 PSI)
       i += 3;
     }
     // HORN+BELL (БЖ)

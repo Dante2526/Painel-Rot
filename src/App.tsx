@@ -40,8 +40,8 @@ const App = () => {
   const [auditWindow, setAuditWindow] = useState({ start: "06:57:00", end: "09:11:00" });
 
   const CHANNEL_CONFIG: Record<string, { bias: number, mult: number }> = {
-    eg: { bias: 0, mult: 1 },         // Já corrigido no parser (-64)
-    bc: { bias: 0, mult: 0.3 },      // 240 -> 72 PSI (BC)
+    eg: { bias: 0, mult: 1 },         
+    bc: { bias: 0, mult: 1 },      
     velocidade: { bias: 0, mult: 1 }, 
     notch: { bias: 0, mult: 1 },      
     direcao: { bias: 0, mult: 1 }     
@@ -157,7 +157,12 @@ const App = () => {
           <div className="w-20 h-20 bg-blue-600 rounded-3xl flex items-center justify-center shadow-2xl mx-auto mb-8 shadow-blue-600/30">
             <Train size={44} className="text-white" />
           </div>
-          <h1 className="text-5xl font-black mb-4 tracking-tighter italic text-transparent bg-clip-text bg-gradient-to-r from-white to-blue-400">PAINEL-ROT</h1>
+          <h1 className="text-5xl font-black mb-1 tracking-tighter italic text-transparent bg-clip-text bg-gradient-to-r from-white to-blue-400">PAINEL-ROT</h1>
+          <div className="flex justify-center mb-6">
+            <span className="px-3 py-1 bg-blue-500/20 text-blue-400 text-[10px] font-black uppercase tracking-widest rounded-full border border-blue-500/30">
+              Versão 3.14.40.5
+            </span>
+          </div>
           <p className="text-slate-400 mb-12 text-lg font-medium leading-relaxed">
             Auditoria avançada de telemetria Wabtec. <br/>
             Carregue os dados da locomotiva para iniciar.
