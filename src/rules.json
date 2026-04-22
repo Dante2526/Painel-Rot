@@ -35,34 +35,6 @@
       "limit": 40,
       "unit": "km/h",
       "description": "Velocidade máxima permitida em áreas de manobra e pátios conforme ROF."
-    },
-    {
-      "id": "pneumatic-refill",
-      "name": "Abastecimento Pneumático",
-      "limit": 1,
-      "unit": "minuto",
-      "description": "Garantir o cumprimento do tempo de 1 minuto para o processo de abastecimento do sistema pneumático."
-    },
-    {
-      "id": "correct-startup",
-      "name": "Arrancada Correta",
-      "limit": 1,
-      "unit": "check",
-      "description": "Verificação obrigatória do acionamento da buzina e progressão gradual do acelerador durante a arrancada."
-    },
-    {
-      "id": "dumper-speed",
-      "name": "Velocidade no Virador",
-      "limit": 30,
-      "unit": "km/h",
-      "description": "Velocidade máxima permitida durante a circulação e posicionamento no virador de vagões."
-    },
-    {
-      "id": "positive-pressure-test",
-      "name": "Teste de Pressão Positiva",
-      "limit": 1,
-      "unit": "minuto",
-      "description": "Duração obrigatória de 1 minuto para a realização do teste de pressão positiva."
     }
   ]
 }
