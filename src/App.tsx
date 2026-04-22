@@ -97,10 +97,9 @@ const App = () => {
     if (startIndex < 0 || startIndex >= totalSamples || endIndex <= startIndex) {
       startIndex = 0;
       endIndex = totalSamples;
-      finalEnd = totalSamples;
     } else {
-      // Garante que o finalEnd não estoure o arquivo
-      finalEnd = Math.min(totalSamples, finalEnd);
+      // Garante que o endIndex não estoure o arquivo
+      endIndex = Math.min(totalSamples, endIndex);
     }
 
     const result = [];
