@@ -26,12 +26,12 @@ export const parseWabtecBinary = (buffer: ArrayBuffer): TelemetryData => {
   const TAGS = {
     EG: [0x26, 0x82, 0x80],
     BC: [0x84, 0xA8, 0x8A], // Corrigido de E8 para A8 conforme feedback
-    NOTCH: [0xC2],
-    HORN: [0xC1, 0xC2],
-    BELL: [0xC1, 0xC4],
-    HORN_BELL: [0xC1, 0xC6],
-    FWD: [0xCC, 0xC4, 0xC0, 0xC0, 0xC0],
-    REV: [0xCC, 0xC4, 0xC0, 0xC0, 0xD0],
+    NOTCH: [0x82],         // Corrigido de C2 para 82 (C2 - 64)
+    HORN: [0x81, 0x82],    // Corrigido de C1 C2 para 81 82
+    BELL: [0x81, 0x84],    // Corrigido de C1 C4 para 81 84
+    HORN_BELL: [0x81, 0x86], // Corrigido de C1 C6 para 81 86 (БЖ)
+    FWD: [0x8C, 0x84, 0x80, 0x80, 0x80], // Corrigido com offset -64 (CC C4 C0...)
+    REV: [0x8C, 0x84, 0x80, 0x80, 0x90], // Corrigido com offset -64 (CC C4 C0...D0)
     TIME_SYNC: 0xEB
   };
 
