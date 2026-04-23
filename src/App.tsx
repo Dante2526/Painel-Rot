@@ -128,6 +128,10 @@ const App = () => {
   useEffect(() => {
     if (!fileData) return;
     
+    // Determina o tamanho total dos dados usando o maior canal disponível
+    const totalSamples = Math.max(...Object.values(fileData).map(arr => arr.length));
+    if (totalSamples === 0) return;
+
     // Converte auditWindow para índices
     const [hS, mS, sS] = auditWindow.start.split(':').map(Number);
     const [hF, mF, sF] = fileStartTime.split(':').map(Number);
@@ -136,9 +140,15 @@ const App = () => {
     const [hE, mE, sE] = auditWindow.end.split(':').map(Number);
     const endSecs = (hE * 3600 + mE * 60 + sE) - (hF * 3600 + mF * 60 + sF);
 
-    // Ajusta para ciclos de 24h se necessário
-    const startIndex = Math.max(0, startSecs);
-    const endIndex = Math.min(fileData['offset_11']?.length || 0, endSecs);
+    // Calcula índices com fallback para dados completos
+    let startIndex = Math.max(0, startSecs);
+    let endIndex = Math.min(totalSamples, endSecs);
+
+    // FALLBACK: Se a janela está fora do range, usa TODOS os dados
+    if (startIndex >= totalSamples || endIndex <= startIndex || endIndex <= 0) {
+      startIndex = 0;
+      endIndex = totalSamples;
+    }
 
     const filteredTelemetry: TelemetryData = {};
     Object.keys(fileData).forEach(key => {
