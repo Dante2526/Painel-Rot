@@ -5,7 +5,7 @@
  */
 
 export interface AuditEvent {
-  type: 'REDUCAO_FORTE' | 'CICLICA' | 'ALIVIO_RODAGEM' | 'FRACIONADA';
+  type: 'REDUCAO_FORTE' | 'CICLICA' | 'ALIVIO_RODAGEM' | 'FRACIONADA' | 'ABASTECIMENTO_IRREGULAR';
   timestamp: number;
   description: string;
   severity: 'ALERTA' | 'INFRAÇÃO';
@@ -42,38 +42,57 @@ export const auditConduction = (data: TelemetryData): AuditResult => {
   const buzina = data['buzina'] || [];
   const sino = data['sino'] || [];
 
+  // ============================================================
+  // Regra: Abastecimento Prolongado (CUMULATIVO)
+  // Conta o TOTAL de segundos com EG < 90 PSI com trem parado.
+  // Se total > 60s, é infração.
+  // ============================================================
+  const EG_NOMINAL = 90;
+  const SUPPLY_THRESHOLD = 60; // segundos
+  let supplyActiveCount = 0;
+  let supplyStart = -1;
+  let supplyEnd = -1;
+
+  for (let i = 0; i < eg.length; i++) {
+    const currentSpeed = vel[i] || 0;
+    const currentP = eg[i];
+
+    // Condição de abastecimento: parado E pressão abaixo do nominal
+    if (currentSpeed <= 0 && currentP < EG_NOMINAL) {
+      supplyActiveCount++;
+      if (supplyStart === -1) supplyStart = i;
+      supplyEnd = i;
+    }
+  }
+
+  console.log(`[Auditor] Abastecimento: ${supplyActiveCount}s com EG < ${EG_NOMINAL} PSI parado (limite: ${SUPPLY_THRESHOLD}s)`);
+
+  if (supplyActiveCount > SUPPLY_THRESHOLD) {
+    compliance.abastecimento_correto = false;
+    const minutos = Math.floor(supplyActiveCount / 60);
+    const segundos = supplyActiveCount % 60;
+    events.push({
+      timestamp: supplyStart,
+      type: 'ABASTECIMENTO_IRREGULAR',
+      severity: 'INFRAÇÃO',
+      description: `Abastecimento prolongado: ${minutos}m${segundos}s com EG abaixo de ${EG_NOMINAL} PSI (trem parado). Limite: 1 minuto.`
+    });
+  }
+
+  // ============================================================
+  // Outras regras de condução
+  // ============================================================
   let lastPressure = eg[0] || 0;
   let lastReleaseTime = -1;
   let isReleased = true;
-  let lowPressureStartTime = -1;
 
   for (let i = 1; i < eg.length; i++) {
     const currentSpeed = vel[i] || 0;
     const currentP = eg[i];
     const currentNotch = notch[i] || 0;
 
-    // --- Regra: Abastecimento (EG < 90 PSI por > 60s parado) ---
-    if (currentSpeed <= 0 && currentP < 90) {
-      if (lowPressureStartTime === -1) lowPressureStartTime = i;
-      const duration = i - lowPressureStartTime;
-      if (duration > 60) {
-        if (compliance.abastecimento_correto) {
-          compliance.abastecimento_correto = false;
-          events.push({
-            timestamp: i,
-            type: 'ABASTECIMENTO_IRREGULAR',
-            severity: 'INFRAÇÃO',
-            description: `Abastecimento prolongado: EG abaixo de 90 PSI por mais de 60s com trem parado.`
-          });
-        }
-      }
-    } else {
-      lowPressureStartTime = -1;
-    }
-
     // --- Regra: Arrancada Segura (Buzina + Sino antes de P3) ---
     if (i > 5 && (vel[i-1] <= 0) && (vel[i] > 0)) {
-      // Verifica se houve buzina e sino nos últimos 10 segundos antes de atingir Notch 3
       let safeStart = false;
       for (let j = Math.max(0, i - 10); j <= i; j++) {
         if (buzina[j] === 1 && sino[j] === 1) {
@@ -86,14 +105,14 @@ export const auditConduction = (data: TelemetryData): AuditResult => {
         compliance.arrancada_segura = false;
         events.push({
           timestamp: i,
-          type: 'ARRANCADA_IRREGULAR',
+          type: 'ARRANCADA_IRREGULAR' as any,
           severity: 'INFRAÇÃO',
           description: `Arrancada sem Buzina+Sino antes do Ponto 3.`
         });
       }
     }
 
-    // --- Outras regras existentes atualizadas para os novos nomes de canais ---
+    // --- Regra: Redução Forte (queda > 18 PSI) ---
     const drop = lastPressure - currentP;
     if (drop > 18 && currentP > 40) {
       compliance.reducao_forte = false;
@@ -105,6 +124,7 @@ export const auditConduction = (data: TelemetryData): AuditResult => {
       });
     }
 
+    // --- Regra: Frenagem Cíclica ---
     if (currentP < (lastPressure - 5) && isReleased) {
       if (lastReleaseTime !== -1 && (i - lastReleaseTime) < 20) {
         events.push({

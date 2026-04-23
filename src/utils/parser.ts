@@ -37,7 +37,7 @@ export const parseWabtecBinary = (buffer: ArrayBuffer): TelemetryData => {
 
   let currentSecond = 0;
   let lastValues: { [key: string]: number } = {
-    eg: 90, bc: 0, notch: 0, buzina: 0, sino: 0, direcao: 1, velocidade: 0
+    eg: 0, bc: 0, notch: 0, buzina: 0, sino: 0, direcao: 1, velocidade: 0
   };
 
   const fillSecond = () => {
@@ -71,7 +71,7 @@ export const parseWabtecBinary = (buffer: ArrayBuffer): TelemetryData => {
     // Busca por Tags
     // EG (&BA)
     if (data[i] === TAGS.EG[0] && data[i+1] === TAGS.EG[1] && data[i+2] === TAGS.EG[2]) {
-      lastValues.eg = (data[i+3] - 64) * 0.625; // Escala 0-160 PSI (142 * 0.625 = 88.75)
+      lastValues.eg = Math.min(90, (data[i+3] - 64) * 0.5114); // Escala 0-90 PSI (clamp max 90)
       i += 3;
     }
     // BC (ДиК)
